@@ -20,6 +20,7 @@ pub struct Config {
     pub ingest: Ingest,
     pub lease: Lease,
     pub elision: Elision,
+    pub spatial: Spatial,
     pub cache: Cache,
     pub cql: Cql,
     pub redis: RedisCfg,
@@ -310,6 +311,21 @@ impl Default for Elision {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
+pub struct Spatial {
+    /// H3 resolution for the "what is known near here" index. Nine is about a
+    /// 170 m cell, which is fine enough to be useful and coarse enough that a
+    /// settled station almost never changes cell.
+    pub h3_resolution: u8,
+}
+
+impl Default for Spatial {
+    fn default() -> Self {
+        Self { h3_resolution: 9 }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
 pub struct Cache {
     pub enabled: bool,
     /// How long a known station stays cached.
@@ -510,6 +526,9 @@ impl Config {
         }
         if self.score.min_sample_score > self.score.max_sample_score {
             return bad("score.min_sample_score is above score.max_sample_score".into());
+        }
+        if self.spatial.h3_resolution > 15 {
+            return bad("spatial.h3_resolution must be 15 or less".into());
         }
         if self.api.max_networks == 0 {
             return bad("api.max_networks must be at least 1".into());
