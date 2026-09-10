@@ -12,8 +12,10 @@ pub mod config;
 pub mod geo;
 pub mod ingest;
 pub mod locate;
+pub mod metrics;
 pub mod model;
 pub mod redis_backend;
+pub mod replay;
 
 pub use config::Config;
 pub mod store;
