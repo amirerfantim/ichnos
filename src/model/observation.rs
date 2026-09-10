@@ -176,6 +176,7 @@ mod tests {
     use super::*;
     use crate::model::key::{CellKey, WifiKey};
     use approx::assert_relative_eq;
+    use std::f64::consts::FRAC_1_SQRT_2;
 
     fn wifi_obs() -> Observation {
         Observation {
@@ -203,7 +204,7 @@ mod tests {
     fn accuracy_weight_follows_the_documented_curve() {
         let cfg = Validation::default();
         let mut o = wifi_obs();
-        for (accuracy, want) in [(10.0, 1.0), (20.0, 0.7071), (40.0, 0.5), (100.0, 0.3162)] {
+        for (accuracy, want) in [(10.0, 1.0), (20.0, FRAC_1_SQRT_2), (40.0, 0.5), (100.0, 0.3162)] {
             o.accuracy = Some(accuracy);
             assert_relative_eq!(o.accuracy_weight(&cfg), want, epsilon = 1e-4);
         }
@@ -247,7 +248,7 @@ mod tests {
     fn age_weight_follows_the_documented_curve() {
         let cfg = Validation::default();
         let mut o = wifi_obs();
-        for (age, want) in [(0.0, 1.0), (2_000.0, 1.0), (4_000.0, 0.7071), (8_000.0, 0.5)] {
+        for (age, want) in [(0.0, 1.0), (2_000.0, 1.0), (4_000.0, FRAC_1_SQRT_2), (8_000.0, 0.5)] {
             o.age_ms = Some(age);
             assert_relative_eq!(o.age_weight(&cfg), want, epsilon = 1e-4);
         }
@@ -275,7 +276,7 @@ mod tests {
     fn speed_weight_rewards_standing_still() {
         let cfg = Validation::default();
         let mut o = wifi_obs();
-        for (speed, want) in [(0.0, 1.0), (5.0, 1.0), (10.0, 0.7071), (20.0, 0.5)] {
+        for (speed, want) in [(0.0, 1.0), (5.0, 1.0), (10.0, FRAC_1_SQRT_2), (20.0, 0.5)] {
             o.speed = Some(speed);
             assert_relative_eq!(o.speed_weight(&cfg), want, epsilon = 1e-4);
         }

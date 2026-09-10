@@ -97,7 +97,7 @@ impl<S: Store, C: CacheBackend> Store for CachedStore<S, C> {
         let mut found: Vec<Station> = Vec::with_capacity(keys.len());
         let mut to_fetch: Vec<StationKey> = Vec::new();
 
-        for (key, entry) in keys.iter().zip(cached.into_iter()) {
+        for (key, entry) in keys.iter().zip(cached) {
             match entry.as_deref() {
                 Some(NEGATIVE) => {
                     // Known absent. No read, no result.
