@@ -1,0 +1,132 @@
+# Ichnos on Kubernetes.
+#
+# Two Deployments from one image. The API and the worker are separate so the
+# read path and the write path scale apart, and so a busy worker cannot slow
+# down an answer.
+#
+# Replace IMAGE_REF before applying.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ichnos-config
+data:
+  config.toml: |
+    [server]
+    bind = "0.0.0.0:8080"
+
+    [cql]
+    nodes = ["scylla:9042"]
+    keyspace = "ichnos"
+    consistency_write = "LOCAL_QUORUM"
+    consistency_read = "LOCAL_ONE"
+    ttl_days = 180
+
+    [redis]
+    cache_url = "redis://redis-cache:6379/0"
+    queue_url = "redis://redis-queue:6379/0"
+
+    [ingest]
+    shards = 32
+    fold_window_secs = 45
+    stream_maxlen = 200000
+
+    [lease]
+    ttl_secs = 15
+    renew_secs = 5
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ichnos
+  labels: {app: ichnos}
+spec:
+  selector: {app: ichnos, component: api}
+  ports:
+    - {name: http, port: 8080, targetPort: 8080}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ichnos-api
+  labels: {app: ichnos, component: api}
+spec:
+  replicas: 2
+  selector:
+    matchLabels: {app: ichnos, component: api}
+  template:
+    metadata:
+      labels: {app: ichnos, component: api}
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+        prometheus.io/path: "/metrics"
+    spec:
+      containers:
+        - name: ichnos
+          image: IMAGE_REF
+          args: ["serve", "--config", "/etc/ichnos/config.toml"]
+          ports: [{containerPort: 8080, name: http}]
+          env:
+            - name: ICHNOS_LOG
+              value: info
+          # Liveness only says the process is up. Readiness also checks that
+          # storage answers, so a pod that cannot serve is taken out of
+          # rotation rather than returning errors.
+          livenessProbe:
+            httpGet: {path: /health, port: 8080}
+            initialDelaySeconds: 5
+            periodSeconds: 15
+          readinessProbe:
+            httpGet: {path: /ready, port: 8080}
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            requests: {cpu: "100m", memory: "128Mi"}
+            limits: {cpu: "1", memory: "512Mi"}
+          volumeMounts:
+            - {name: config, mountPath: /etc/ichnos}
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: {drop: ["ALL"]}
+      volumes:
+        - name: config
+          configMap: {name: ichnos-config}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ichnos-worker
+  labels: {app: ichnos, component: worker}
+spec:
+  replicas: 2
+  selector:
+    matchLabels: {app: ichnos, component: worker}
+  template:
+    metadata:
+      labels: {app: ichnos, component: worker}
+    spec:
+      # Long enough for a worker to finish its batch and hand its shards back,
+      # so a restart is picked up in seconds rather than when leases expire.
+      terminationGracePeriodSeconds: 60
+      containers:
+        - name: ichnos
+          image: IMAGE_REF
+          args: ["worker", "--config", "/etc/ichnos/config.toml"]
+          env:
+            - name: ICHNOS_LOG
+              value: info
+            # Each worker needs its own name in the lease registry, or two of
+            # them would believe they own the same shard.
+            - name: POD_NAME
+              valueFrom: {fieldRef: {fieldPath: metadata.name}}
+          resources:
+            requests: {cpu: "100m", memory: "128Mi"}
+            limits: {cpu: "1", memory: "512Mi"}
+          volumeMounts:
+            - {name: config, mountPath: /etc/ichnos}
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: {drop: ["ALL"]}
+      volumes:
+        - name: config
+          configMap: {name: ichnos-config}
