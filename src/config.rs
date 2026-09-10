@@ -359,6 +359,14 @@ pub struct Cql {
     pub ttl_days: u32,
     pub connect_timeout_ms: u64,
     pub request_timeout_ms: u64,
+    /// Rewrite the addresses nodes advertise into ones this process can
+    /// actually reach, as `"advertised" = "reachable"`.
+    ///
+    /// A node tells clients where to find it, and behind NAT, a load balancer
+    /// or a forwarded port that address is not reachable from outside. Without
+    /// a rewrite the driver connects once for metadata and then times out
+    /// dialling an address it cannot route to.
+    pub address_map: std::collections::BTreeMap<String, String>,
 }
 
 impl Default for Cql {
@@ -375,6 +383,7 @@ impl Default for Cql {
             ttl_days: 180,
             connect_timeout_ms: 5_000,
             request_timeout_ms: 2_000,
+            address_map: std::collections::BTreeMap::new(),
         }
     }
 }
