@@ -75,6 +75,7 @@ mod tests {
     use super::*;
     use crate::model::key::{StationKey, WifiKey};
     use approx::assert_relative_eq;
+    use std::f64::consts::LOG2_10;
 
     fn day(y: i32, m: u32, d: u32) -> NaiveDate {
         NaiveDate::from_ymd_opt(y, m, d).unwrap()
@@ -158,7 +159,7 @@ mod tests {
     fn sample_weight_is_logarithmic_and_bounded() {
         let cfg = ScoreCfg::default();
         let mut s = established();
-        for (samples, want) in [(1, 0.5), (2, 1.0), (10, 3.3219), (100, 6.6438), (1024, 10.0)] {
+        for (samples, want) in [(1, 0.5), (2, 1.0), (10, LOG2_10), (100, 2.0 * LOG2_10), (1024, 10.0)] {
             s.samples = samples;
             assert_relative_eq!(sample_weight(&s, &cfg), want, epsilon = 1e-3);
         }
@@ -207,8 +208,7 @@ mod tests {
 
     #[test]
     fn bounds_come_from_config() {
-        let mut cfg = ScoreCfg::default();
-        cfg.max_sample_score = 3.0;
+        let cfg = ScoreCfg { max_sample_score: 3.0, ..ScoreCfg::default() };
         let mut s = established();
         s.samples = 100_000;
         assert_relative_eq!(sample_weight(&s, &cfg), 3.0, epsilon = 1e-9);

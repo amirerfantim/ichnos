@@ -389,7 +389,7 @@ mod tests {
     #[test]
     fn a_lone_candidate_is_returned_unchanged() {
         let only = position(35.7200, 51.3300, 123.0, 1.0);
-        assert_eq!(best(&[only.clone()]).unwrap(), only);
+        assert_eq!(best(std::slice::from_ref(&only)).unwrap(), only);
     }
 
     #[test]

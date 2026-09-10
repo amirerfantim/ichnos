@@ -11,7 +11,7 @@ const EARTH_RADIUS: f64 = 6371.009;
 
 /// WGS-84 ellipsoid constants, used by Vincenty.
 const EARTH_MAJOR_RADIUS: f64 = 6378.137;
-const EARTH_MINOR_RADIUS: f64 = 6356.752_314_245;
+const EARTH_MINOR_RADIUS: f64 = 6_356.752_314_245;
 const EARTH_FLATTENING: f64 = 0.003_352_810_664_747_480_5; // 1.0 / 298.257223563
 
 const VINCENTY_CUTOFF: f64 = 0.000_000_000_01; // 10e-12
@@ -191,8 +191,8 @@ mod tests {
     /// upstream and every position the service computes will drift with it.
     const GOLDEN: &[(f64, f64, f64, f64, f64, f64)] = &[
         // lat1, lon1, lat2, lon2, distance (vincenty), haversine
-        (35.7219, 51.3347, 35.7000, 51.3900, 5562.930_115_973_376, 5555.086_558_405_209),
-        (35.7219, 51.3347, 35.7300, 51.3400, 1018.648_575_262_783_4, 1019.863_969_984_350_7),
+        (35.7219, 51.3347, 35.7000, 51.3900, 5_562.930_115_973_376, 5_555.086_558_405_209),
+        (35.7219, 51.3347, 35.7300, 51.3400, 1_018.648_575_262_783_4, 1_019.863_969_984_350_7),
         (35.7219, 51.3347, 35.7219, 51.3347, 0.0, 0.0),
         (35.6892, 51.3890, 32.6539, 51.6660, 337_659.106_530_146_9, 338_470.595_001_159_4),
         (0.0, 0.0, 0.0, 1.0, 111_319.490_779_203_23, 111_195.083_724_191_41),
@@ -266,7 +266,7 @@ mod tests {
     fn max_distance_picks_the_furthest_point() {
         let points = [(35.7219, 51.3347), (35.7000, 51.3900), (35.7300, 51.3400)];
         let got = max_distance(35.7219, 51.3347, &points);
-        assert_relative_eq!(got, 5562.930_115_973_376, max_relative = 1e-12);
+        assert_relative_eq!(got, 5_562.930_115_973_376, max_relative = 1e-12);
     }
 
     #[test]
