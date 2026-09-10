@@ -53,7 +53,7 @@ impl ShardOutcome {
 ///
 /// Split out from the loop so it can be driven directly by tests and by the
 /// replay harness, neither of which want a running event loop or a lease.
-pub async fn process_shard<Q: Queue, S: Store>(
+pub async fn process_shard<Q: Queue + ?Sized, S: Store + ?Sized>(
     queue: &Q,
     store: &S,
     shard: u32,
@@ -133,7 +133,7 @@ pub enum WorkerError {
 }
 
 /// A running worker.
-pub struct Worker<Q: Queue, S: Store, L: Leases> {
+pub struct Worker<Q: Queue + ?Sized, S: Store + ?Sized, L: Leases + ?Sized> {
     queue: Arc<Q>,
     store: Arc<S>,
     leases: Arc<L>,
@@ -143,7 +143,7 @@ pub struct Worker<Q: Queue, S: Store, L: Leases> {
     held: HashSet<u32>,
 }
 
-impl<Q: Queue, S: Store, L: Leases> Worker<Q, S, L> {
+impl<Q: Queue + ?Sized, S: Store + ?Sized, L: Leases + ?Sized> Worker<Q, S, L> {
     pub fn new(queue: Arc<Q>, store: Arc<S>, leases: Arc<L>, cfg: Config, identity: String) -> Self {
         Self { queue, store, leases, cfg, identity, held: HashSet::new() }
     }
