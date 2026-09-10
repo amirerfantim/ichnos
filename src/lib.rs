@@ -16,3 +16,4 @@ pub mod model;
 
 pub use config::Config;
 pub mod store;
+pub mod worker;

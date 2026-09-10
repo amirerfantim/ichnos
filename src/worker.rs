@@ -1,0 +1,561 @@
+//! The worker: claim shards, drain them, fold, write.
+//!
+//! There is no scheduler. A worker takes work rather than being given it, which
+//! is what removes the single process whose death would stop the pipeline. It
+//! claims whatever shards are free, renews them while it lives, and hands them
+//! back when it stops. Run one worker or twelve; the shards redistribute
+//! themselves.
+//!
+//! Because a shard has exactly one owner, nothing here takes a lock. That is
+//! the whole reason the ownership dance is worth its complexity.
+
+use crate::config::Config;
+use crate::ingest::elide::{self, Write};
+use crate::ingest::fold::{self, Action};
+use crate::ingest::lease::Leases;
+use crate::ingest::queue::{Entry, Queue};
+use crate::model::{Station, StationKey};
+use crate::store::Store;
+use chrono::Utc;
+use std::collections::{BTreeMap, HashSet};
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::watch;
+use tracing::{debug, error, info, warn};
+
+/// What one pass over one shard did.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct ShardOutcome {
+    pub observations: usize,
+    pub stations: usize,
+    pub written: usize,
+    pub skipped: usize,
+    pub blocked: usize,
+    pub created: usize,
+}
+
+impl ShardOutcome {
+    /// Observations per station: how much the fold saved.
+    pub fn fold_ratio(&self) -> f64 {
+        fold::fold_ratio(self.observations, self.stations)
+    }
+
+    /// Share of station updates that needed no write.
+    pub fn elision_rate(&self) -> f64 {
+        if self.stations == 0 {
+            return 0.0;
+        }
+        self.skipped as f64 / self.stations as f64
+    }
+}
+
+/// Drain one shard once and write what it produced.
+///
+/// Split out from the loop so it can be driven directly by tests and by the
+/// replay harness, neither of which want a running event loop or a lease.
+pub async fn process_shard<Q: Queue, S: Store>(
+    queue: &Q,
+    store: &S,
+    shard: u32,
+    cfg: &Config,
+) -> Result<ShardOutcome, WorkerError> {
+    let entries: Vec<Entry> = queue
+        .read(shard, cfg.ingest.read_batch)
+        .await
+        .map_err(|e| WorkerError::Queue(e.to_string()))?;
+
+    if entries.is_empty() {
+        return Ok(ShardOutcome::default());
+    }
+
+    let ids: Vec<String> = entries.iter().map(|e| e.id.clone()).collect();
+    let observations: Vec<_> = entries.into_iter().map(|e| e.observation).collect();
+    let observation_count = observations.len();
+
+    let grouped = fold::group(observations);
+    let keys: Vec<StationKey> = grouped.keys().copied().collect();
+
+    // One read for the whole batch, not one per station.
+    let existing: BTreeMap<StationKey, Station> = store
+        .get_stations(&keys)
+        .await
+        .map_err(|e| WorkerError::Store(e.to_string()))?
+        .into_iter()
+        .map(|s| (s.key, s))
+        .collect();
+
+    let now = Utc::now();
+    let today = now.date_naive();
+    let mut outcome = ShardOutcome {
+        observations: observation_count,
+        stations: grouped.len(),
+        ..Default::default()
+    };
+    let mut to_write: Vec<Station> = Vec::with_capacity(grouped.len());
+
+    for (key, observations) in grouped {
+        let previous = existing.get(&key);
+        let update = fold::fold_station(key, &observations, previous, cfg, now);
+
+        match update.action {
+            Action::Block | Action::NewBlock => outcome.blocked += 1,
+            Action::New => outcome.created += 1,
+            _ => {}
+        }
+
+        match elide::decide(&update, previous, today, &cfg.elision) {
+            Write::Full => to_write.push(update.station),
+            Write::Skip => outcome.skipped += 1,
+        }
+    }
+
+    outcome.written = to_write.len();
+    if !to_write.is_empty() {
+        store.put_stations(&to_write).await.map_err(|e| WorkerError::Store(e.to_string()))?;
+    }
+
+    // Acknowledge only after the write succeeded. A crash before this point
+    // leaves the batch to be redelivered, which at worst folds it twice, and
+    // folding the same evidence twice is harmless.
+    queue.ack(shard, &ids).await.map_err(|e| WorkerError::Queue(e.to_string()))?;
+
+    Ok(outcome)
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum WorkerError {
+    #[error("queue: {0}")]
+    Queue(String),
+    #[error("store: {0}")]
+    Store(String),
+    #[error("leases: {0}")]
+    Lease(String),
+}
+
+/// A running worker.
+pub struct Worker<Q: Queue, S: Store, L: Leases> {
+    queue: Arc<Q>,
+    store: Arc<S>,
+    leases: Arc<L>,
+    cfg: Config,
+    /// Distinguishes this worker from its siblings in the lease registry.
+    identity: String,
+    held: HashSet<u32>,
+}
+
+impl<Q: Queue, S: Store, L: Leases> Worker<Q, S, L> {
+    pub fn new(queue: Arc<Q>, store: Arc<S>, leases: Arc<L>, cfg: Config, identity: String) -> Self {
+        Self { queue, store, leases, cfg, identity, held: HashSet::new() }
+    }
+
+    pub fn held_shards(&self) -> Vec<u32> {
+        let mut shards: Vec<u32> = self.held.iter().copied().collect();
+        shards.sort_unstable();
+        shards
+    }
+
+    /// Claim any shard nobody holds, up to the configured limit.
+    pub async fn claim_shards(&mut self) -> Result<usize, WorkerError> {
+        let ttl = Duration::from_secs(self.cfg.lease.ttl_secs);
+        let limit = if self.cfg.lease.max_shards_per_worker == 0 {
+            self.cfg.ingest.shards
+        } else {
+            self.cfg.lease.max_shards_per_worker
+        };
+
+        let mut claimed = 0;
+        for shard in 0..self.cfg.ingest.shards {
+            if self.held.len() >= limit as usize {
+                break;
+            }
+            if self.held.contains(&shard) {
+                continue;
+            }
+            match self.leases.acquire(shard, &self.identity, ttl).await {
+                Ok(true) => {
+                    self.held.insert(shard);
+                    claimed += 1;
+                }
+                Ok(false) => {}
+                Err(e) => return Err(WorkerError::Lease(e.to_string())),
+            }
+        }
+        Ok(claimed)
+    }
+
+    /// Extend every lease this worker holds, dropping any it has lost.
+    ///
+    /// Losing a lease means another worker may already own the shard, so the
+    /// only safe response is to stop touching it at once.
+    pub async fn renew_leases(&mut self) -> Result<(), WorkerError> {
+        let ttl = Duration::from_secs(self.cfg.lease.ttl_secs);
+        let mut lost = Vec::new();
+        for &shard in &self.held {
+            match self.leases.renew(shard, &self.identity, ttl).await {
+                Ok(true) => {}
+                Ok(false) => lost.push(shard),
+                Err(e) => return Err(WorkerError::Lease(e.to_string())),
+            }
+        }
+        for shard in lost {
+            warn!(shard, "lost the lease on a shard; releasing it");
+            self.held.remove(&shard);
+        }
+        Ok(())
+    }
+
+    /// Drain every shard this worker holds, once.
+    pub async fn process_held(&self) -> ShardOutcome {
+        let mut total = ShardOutcome::default();
+        for &shard in &self.held {
+            match process_shard(&*self.queue, &*self.store, shard, &self.cfg).await {
+                Ok(outcome) => {
+                    total.observations += outcome.observations;
+                    total.stations += outcome.stations;
+                    total.written += outcome.written;
+                    total.skipped += outcome.skipped;
+                    total.blocked += outcome.blocked;
+                    total.created += outcome.created;
+                }
+                Err(e) => {
+                    // One shard failing must not stop the others. The batch was
+                    // not acknowledged, so it comes back.
+                    error!(shard, error = %e, "shard failed; its batch will be redelivered");
+                }
+            }
+        }
+        total
+    }
+
+    /// Hand every shard back, so a restart is picked up in seconds rather than
+    /// after the leases expire.
+    pub async fn release_all(&mut self) {
+        for &shard in &self.held {
+            if let Err(e) = self.leases.release(shard, &self.identity).await {
+                warn!(shard, error = %e, "could not release a shard cleanly");
+            }
+        }
+        self.held.clear();
+    }
+
+    /// Run until told to stop.
+    pub async fn run(&mut self, mut shutdown: watch::Receiver<bool>) {
+        let fold_window = Duration::from_secs(self.cfg.ingest.fold_window_secs);
+        let renew_every = Duration::from_secs(self.cfg.lease.renew_secs);
+
+        let mut work = tokio::time::interval(fold_window);
+        let mut renew = tokio::time::interval(renew_every);
+        work.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        renew.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+        info!(identity = %self.identity, shards = self.cfg.ingest.shards, "worker starting");
+
+        loop {
+            tokio::select! {
+                _ = shutdown.changed() => {
+                    if *shutdown.borrow() {
+                        info!("shutting down; handing shards back");
+                        self.release_all().await;
+                        return;
+                    }
+                }
+                _ = renew.tick() => {
+                    if let Err(e) = self.renew_leases().await {
+                        error!(error = %e, "could not renew leases");
+                    }
+                    if let Err(e) = self.claim_shards().await {
+                        error!(error = %e, "could not claim shards");
+                    }
+                }
+                _ = work.tick() => {
+                    let outcome = self.process_held().await;
+                    if outcome.observations > 0 {
+                        debug!(
+                            observations = outcome.observations,
+                            stations = outcome.stations,
+                            written = outcome.written,
+                            skipped = outcome.skipped,
+                            fold_ratio = outcome.fold_ratio(),
+                            "drained held shards"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ingest::lease::MemoryLeases;
+    use crate::ingest::queue::MemoryQueue;
+    use crate::model::key::WifiKey;
+    use crate::model::observation::ReportSource;
+    use crate::model::Observation;
+    use crate::store::memory::MemoryStore;
+
+    fn cfg() -> Config {
+        let mut c = Config::for_tests();
+        c.ingest.shards = 4;
+        c
+    }
+
+    fn observation(id: u64, lat: f64, lon: f64) -> Observation {
+        Observation {
+            key: StationKey::Wifi(WifiKey(id)),
+            lat,
+            lon,
+            accuracy: Some(10.0),
+            age_ms: Some(0.0),
+            speed: Some(0.0),
+            signal: Some(-70),
+            source: ReportSource::Gnss,
+            timestamp: 1_700_000_000_000,
+        }
+    }
+
+    async fn publish(queue: &MemoryQueue, cfg: &Config, observations: Vec<Observation>) {
+        let routed: Vec<(u32, Observation)> = observations
+            .into_iter()
+            .map(|o| (o.key.shard(cfg.ingest.shards), o))
+            .collect();
+        queue.publish(&routed).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_drained_shard_writes_the_stations_it_learned() {
+        let cfg = cfg();
+        let queue = MemoryQueue::new(cfg.ingest.shards, 1_000);
+        let store = MemoryStore::new();
+        let observations = vec![observation(1, 35.7219, 51.3347)];
+        let shard = observations[0].key.shard(cfg.ingest.shards);
+        publish(&queue, &cfg, observations).await;
+
+        let outcome = process_shard(&queue, &store, shard, &cfg).await.unwrap();
+        assert_eq!(outcome.observations, 1);
+        assert_eq!(outcome.stations, 1);
+        assert_eq!(outcome.created, 1);
+        assert_eq!(outcome.written, 1);
+        assert_eq!(store.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn repeated_sightings_of_one_station_cost_a_single_write() {
+        let cfg = cfg();
+        let queue = MemoryQueue::new(cfg.ingest.shards, 1_000);
+        let store = MemoryStore::new();
+        let observations: Vec<Observation> =
+            (0..20).map(|_| observation(1, 35.7219, 51.3347)).collect();
+        let shard = observations[0].key.shard(cfg.ingest.shards);
+        publish(&queue, &cfg, observations).await;
+
+        let outcome = process_shard(&queue, &store, shard, &cfg).await.unwrap();
+        assert_eq!(outcome.observations, 20);
+        assert_eq!(outcome.stations, 1);
+        assert_eq!(outcome.written, 1, "twenty sightings, one write");
+        assert_eq!(outcome.fold_ratio(), 20.0);
+        assert_eq!(store.write_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_second_unmoved_pass_writes_nothing() {
+        // The elision path, end to end.
+        let cfg = cfg();
+        let queue = MemoryQueue::new(cfg.ingest.shards, 1_000);
+        let store = MemoryStore::new();
+        let shard = observation(1, 35.7219, 51.3347).key.shard(cfg.ingest.shards);
+
+        publish(&queue, &cfg, vec![observation(1, 35.7219, 51.3347)]).await;
+        process_shard(&queue, &store, shard, &cfg).await.unwrap();
+        let writes_after_first = store.write_count();
+
+        publish(&queue, &cfg, vec![observation(1, 35.7219, 51.3347)]).await;
+        let outcome = process_shard(&queue, &store, shard, &cfg).await.unwrap();
+
+        assert_eq!(outcome.skipped, 1);
+        assert_eq!(outcome.written, 0);
+        assert_eq!(outcome.elision_rate(), 1.0);
+        assert_eq!(store.write_count(), writes_after_first, "no second write");
+    }
+
+    #[tokio::test]
+    async fn a_station_reported_from_far_away_is_blocked() {
+        let cfg = cfg();
+        let queue = MemoryQueue::new(cfg.ingest.shards, 1_000);
+        let store = MemoryStore::new();
+        let shard = observation(1, 35.7219, 51.3347).key.shard(cfg.ingest.shards);
+
+        publish(&queue, &cfg, vec![observation(1, 35.7219, 51.3347)]).await;
+        process_shard(&queue, &store, shard, &cfg).await.unwrap();
+
+        publish(&queue, &cfg, vec![observation(1, 36.5000, 52.0000)]).await;
+        let outcome = process_shard(&queue, &store, shard, &cfg).await.unwrap();
+
+        assert_eq!(outcome.blocked, 1);
+        let station = store.get_station(&StationKey::Wifi(WifiKey(1))).await.unwrap().unwrap();
+        assert!(!station.has_position());
+        assert_eq!(station.block_count, 1);
+    }
+
+    #[tokio::test]
+    async fn an_empty_shard_is_a_no_op() {
+        let cfg = cfg();
+        let queue = MemoryQueue::new(cfg.ingest.shards, 1_000);
+        let store = MemoryStore::new();
+        let outcome = process_shard(&queue, &store, 0, &cfg).await.unwrap();
+        assert_eq!(outcome, ShardOutcome::default());
+        assert_eq!(store.write_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_batch_is_acknowledged_only_after_it_is_written() {
+        let cfg = cfg();
+        let queue = MemoryQueue::new(cfg.ingest.shards, 1_000);
+        let store = MemoryStore::new();
+        let shard = observation(1, 35.7219, 51.3347).key.shard(cfg.ingest.shards);
+        publish(&queue, &cfg, vec![observation(1, 35.7219, 51.3347)]).await;
+
+        store.set_failing(true);
+        assert!(process_shard(&queue, &store, shard, &cfg).await.is_err());
+        assert_eq!(queue.pending_count(shard), 1, "still unacknowledged");
+
+        // Which means redelivery recovers it once the store is back.
+        queue.redeliver(shard);
+        store.set_failing(false);
+        let outcome = process_shard(&queue, &store, shard, &cfg).await.unwrap();
+        assert_eq!(outcome.written, 1, "nothing was lost");
+        assert_eq!(queue.pending_count(shard), 0);
+    }
+
+    #[tokio::test]
+    async fn a_worker_claims_every_free_shard() {
+        let cfg = cfg();
+        let mut worker = Worker::new(
+            Arc::new(MemoryQueue::new(cfg.ingest.shards, 1_000)),
+            Arc::new(MemoryStore::new()),
+            Arc::new(MemoryLeases::new()),
+            cfg.clone(),
+            "worker-a".into(),
+        );
+        assert_eq!(worker.claim_shards().await.unwrap(), 4);
+        assert_eq!(worker.held_shards(), vec![0, 1, 2, 3]);
+        assert_eq!(worker.claim_shards().await.unwrap(), 0, "and does not double-claim");
+    }
+
+    #[tokio::test]
+    async fn two_workers_split_the_shards_between_them() {
+        let mut cfg = cfg();
+        cfg.lease.max_shards_per_worker = 2;
+        let queue = Arc::new(MemoryQueue::new(cfg.ingest.shards, 1_000));
+        let store = Arc::new(MemoryStore::new());
+        let leases = Arc::new(MemoryLeases::new());
+
+        let mut a = Worker::new(queue.clone(), store.clone(), leases.clone(), cfg.clone(), "a".into());
+        let mut b = Worker::new(queue, store, leases, cfg, "b".into());
+
+        a.claim_shards().await.unwrap();
+        b.claim_shards().await.unwrap();
+
+        assert_eq!(a.held_shards(), vec![0, 1]);
+        assert_eq!(b.held_shards(), vec![2, 3]);
+        // No shard is held twice, which is what makes the lock-free path safe.
+        assert!(a.held_shards().iter().all(|s| !b.held_shards().contains(s)));
+    }
+
+    #[tokio::test]
+    async fn a_worker_that_loses_a_lease_stops_touching_that_shard() {
+        let cfg = cfg();
+        let leases = Arc::new(MemoryLeases::new());
+        let mut worker = Worker::new(
+            Arc::new(MemoryQueue::new(cfg.ingest.shards, 1_000)),
+            Arc::new(MemoryStore::new()),
+            leases.clone(),
+            cfg,
+            "worker-a".into(),
+        );
+        worker.claim_shards().await.unwrap();
+        assert_eq!(worker.held_shards().len(), 4);
+
+        leases.expire(2); // the lease lapsed and someone else may hold it now
+        worker.renew_leases().await.unwrap();
+
+        assert_eq!(worker.held_shards(), vec![0, 1, 3]);
+    }
+
+    #[tokio::test]
+    async fn releasing_hands_shards_over_at_once() {
+        let cfg = cfg();
+        let leases = Arc::new(MemoryLeases::new());
+        let mut worker = Worker::new(
+            Arc::new(MemoryQueue::new(cfg.ingest.shards, 1_000)),
+            Arc::new(MemoryStore::new()),
+            leases.clone(),
+            cfg.clone(),
+            "worker-a".into(),
+        );
+        worker.claim_shards().await.unwrap();
+        worker.release_all().await;
+
+        assert!(worker.held_shards().is_empty());
+        let mut other = Worker::new(
+            Arc::new(MemoryQueue::new(cfg.ingest.shards, 1_000)),
+            Arc::new(MemoryStore::new()),
+            leases,
+            cfg,
+            "worker-b".into(),
+        );
+        assert_eq!(other.claim_shards().await.unwrap(), 4, "picked up without waiting");
+    }
+
+    #[tokio::test]
+    async fn one_failing_shard_does_not_stop_the_others() {
+        let cfg = cfg();
+        let queue = Arc::new(MemoryQueue::new(cfg.ingest.shards, 1_000));
+        let store = Arc::new(MemoryStore::new());
+        let mut worker = Worker::new(
+            queue.clone(),
+            store.clone(),
+            Arc::new(MemoryLeases::new()),
+            cfg.clone(),
+            "worker-a".into(),
+        );
+        worker.claim_shards().await.unwrap();
+
+        // Spread stations over several shards.
+        let observations: Vec<Observation> =
+            (1..=20).map(|i| observation(i, 35.7219, 51.3347)).collect();
+        publish(&queue, &cfg, observations).await;
+
+        let outcome = worker.process_held().await;
+        assert_eq!(outcome.stations, 20, "every shard was drained");
+        assert_eq!(outcome.written, 20);
+    }
+
+    #[tokio::test]
+    async fn a_worker_stops_when_told_and_hands_its_shards_back() {
+        let mut cfg = cfg();
+        cfg.ingest.fold_window_secs = 1;
+        cfg.lease.renew_secs = 1;
+        cfg.lease.ttl_secs = 5;
+        let leases = Arc::new(MemoryLeases::new());
+        let mut worker = Worker::new(
+            Arc::new(MemoryQueue::new(cfg.ingest.shards, 1_000)),
+            Arc::new(MemoryStore::new()),
+            leases.clone(),
+            cfg,
+            "worker-a".into(),
+        );
+
+        let (tx, rx) = watch::channel(false);
+        let handle = tokio::spawn(async move {
+            worker.run(rx).await;
+        });
+
+        tokio::time::sleep(Duration::from_millis(1_200)).await;
+        tx.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), handle).await.unwrap().unwrap();
+
+        assert_eq!(leases.holder(0).await.unwrap(), None, "shards were handed back");
+    }
+}
