@@ -7,8 +7,10 @@
 //! one at a time, workers own shards instead of taking locks, and reads are
 //! cached.
 
+pub mod api;
 pub mod config;
 pub mod geo;
+pub mod ingest;
 pub mod locate;
 pub mod model;
 

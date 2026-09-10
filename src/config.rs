@@ -123,6 +123,10 @@ pub struct Validation {
     pub min_speed_mps: f64,
     /// source: MAX_SPEED
     pub max_speed_mps: f64,
+    /// Web Mercator's usable range, which is what map tiles and every client
+    /// assume. Anything outside it is a bad fix rather than a polar reading.
+    pub lat_bounds: (f64, f64),
+    pub lon_bounds: (f64, f64),
     pub wifi_frequency_mhz: (i32, i32),
     pub wifi_signal_dbm: (i32, i32),
     pub lac: (i64, i64),
@@ -154,6 +158,8 @@ impl Default for Validation {
             max_accuracy_m: 1_000_000.0,
             min_speed_mps: 0.0,
             max_speed_mps: 300.0,
+            lat_bounds: (-85.051, 85.051),
+            lon_bounds: (-180.0, 180.0),
             wifi_frequency_mhz: (2_400, 5_999),
             wifi_signal_dbm: (-100, -10),
             lac: (1, 65_533),
