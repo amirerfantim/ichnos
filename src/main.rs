@@ -8,10 +8,11 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use ichnos::api::auth::KeyCache;
 use ichnos::api::handlers::{router, AppState};
+use ichnos::api::quota::{MemoryQuota, QuotaCounter};
 use ichnos::config::Config;
 use ichnos::ingest::lease::Leases;
 use ichnos::ingest::queue::{MemoryQueue, Queue};
-use ichnos::redis_backend::{RedisCache, RedisLeases, RedisQueue};
+use ichnos::redis_backend::{RedisCache, RedisLeases, RedisQueue, RedisQuota};
 use ichnos::store::cache::{CachedStore, MemoryCache};
 use ichnos::store::cql::CqlStore;
 use ichnos::store::memory::MemoryStore;
@@ -209,8 +210,23 @@ async fn serve(cfg: Config, in_memory: bool, with_worker: bool) -> Result<()> {
         tokio::spawn(async move { worker.run(rx).await });
     }
 
+    // Counting in Redis keeps one allowance per key across every pod. The
+    // in-memory fallback counts per process, which is honest for a single-node
+    // run and useless for a fleet, so it is only used when there is no Redis.
+    let quota: Arc<dyn QuotaCounter> = if in_memory {
+        Arc::new(MemoryQuota::new())
+    } else {
+        match RedisQuota::connect(&cfg.redis.cache_url).await {
+            Ok(counter) => Arc::new(counter),
+            Err(e) => {
+                warn!(error = %e, "no quota counter available; allowances will not be enforced");
+                Arc::new(MemoryQuota::new())
+            }
+        }
+    };
+
     let bind = cfg.server.bind.clone();
-    let state = AppState { store, queue, cfg: Arc::new(cfg), keys };
+    let state = AppState { store, queue, cfg: Arc::new(cfg), keys, quota };
 
     let listener =
         tokio::net::TcpListener::bind(&bind).await.with_context(|| format!("binding {bind}"))?;

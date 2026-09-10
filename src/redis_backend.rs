@@ -294,6 +294,40 @@ fn as_string(value: &redis::Value) -> Option<String> {
     }
 }
 
+// ---------------------------------------------------------------- quota -----
+
+/// Daily request counters in Redis, so the allowance is shared across every
+/// pod rather than enforced separately by each one.
+#[derive(Clone)]
+pub struct RedisQuota {
+    conn: ConnectionManager,
+}
+
+impl RedisQuota {
+    pub async fn connect(url: &str) -> Result<Self, String> {
+        Ok(Self { conn: connect(url).await? })
+    }
+}
+
+#[async_trait]
+impl crate::api::quota::QuotaCounter for RedisQuota {
+    async fn increment(&self, key: &str) -> Option<i64> {
+        let mut conn = self.conn.clone();
+        let counter = crate::api::quota::counter_key(key);
+        // Increment and set the expiry together, so a counter cannot survive
+        // past the day it belongs to if the second command were to be lost.
+        let (count,): (i64,) = redis::pipe()
+            .atomic()
+            .incr(&counter, 1)
+            .expire(&counter, 172_800)
+            .ignore()
+            .query_async(&mut conn)
+            .await
+            .ok()?;
+        Some(count)
+    }
+}
+
 // --------------------------------------------------------------- leases -----
 
 /// Shard leases in Redis.
