@@ -69,8 +69,7 @@ pub fn decide(
             let Some(previous) = previous else {
                 return Write::Full;
             };
-            let moved = match (previous.lat, previous.lon, update.station.lat, update.station.lon)
-            {
+            let moved = match (previous.lat, previous.lon, update.station.lat, update.station.lon) {
                 (Some(old_lat), Some(old_lon), Some(new_lat), Some(new_lon)) => {
                     distance(old_lat, old_lon, new_lat, new_lon)
                 }

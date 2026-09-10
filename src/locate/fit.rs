@@ -266,10 +266,7 @@ mod tests {
 
     #[test]
     fn identical_stations_fit_to_the_shared_point() {
-        let nets = vec![
-            net(1, 35.7219, 51.3347, 1.0, -70.0),
-            net(2, 35.7219, 51.3347, 1.0, -70.0),
-        ];
+        let nets = vec![net(1, 35.7219, 51.3347, 1.0, -70.0), net(2, 35.7219, 51.3347, 1.0, -70.0)];
         let (lat, lon) = fit_position(&nets);
         assert_relative_eq!(lat, 35.7219, epsilon = 1e-7);
         assert_relative_eq!(lon, 51.3347, epsilon = 1e-7);
@@ -289,14 +286,10 @@ mod tests {
 
     #[test]
     fn accuracy_grows_with_disagreement() {
-        let tight = vec![
-            net(1, 35.7200, 51.3300, 1.0, -70.0),
-            net(2, 35.7202, 51.3302, 1.0, -70.0),
-        ];
-        let loose = vec![
-            net(1, 35.7200, 51.3300, 1.0, -70.0),
-            net(2, 35.7400, 51.3500, 1.0, -70.0),
-        ];
+        let tight =
+            vec![net(1, 35.7200, 51.3300, 1.0, -70.0), net(2, 35.7202, 51.3302, 1.0, -70.0)];
+        let loose =
+            vec![net(1, 35.7200, 51.3300, 1.0, -70.0), net(2, 35.7400, 51.3500, 1.0, -70.0)];
         let a = accuracy_from_spread(35.7201, 51.3301, &tight, 10.0, 500.0);
         let b = accuracy_from_spread(35.7300, 51.3400, &loose, 10.0, 500.0);
         assert!(b > a, "a scattered cluster should report worse accuracy");
@@ -304,10 +297,7 @@ mod tests {
 
     #[test]
     fn accuracy_is_clamped_at_both_ends() {
-        let nets = vec![
-            net(1, 35.7200, 51.3300, 1.0, -70.0),
-            net(2, 35.7200, 51.3300, 1.0, -70.0),
-        ];
+        let nets = vec![net(1, 35.7200, 51.3300, 1.0, -70.0), net(2, 35.7200, 51.3300, 1.0, -70.0)];
         // No spread at all still reports the floor, never zero.
         assert_relative_eq!(
             accuracy_from_spread(35.7200, 51.3300, &nets, 10.0, 500.0),

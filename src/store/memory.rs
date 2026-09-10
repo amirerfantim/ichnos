@@ -179,7 +179,10 @@ mod tests {
         store.put_stations(&[updated]).await.unwrap();
 
         assert_eq!(store.len(), 1);
-        assert_eq!(store.get_station(&StationKey::Wifi(WifiKey(1))).await.unwrap().unwrap().samples, 42);
+        assert_eq!(
+            store.get_station(&StationKey::Wifi(WifiKey(1))).await.unwrap().unwrap().samples,
+            42
+        );
     }
 
     #[tokio::test]

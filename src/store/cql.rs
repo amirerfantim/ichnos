@@ -158,11 +158,23 @@ impl WifiWrite {
     fn new(mac: i64, v: StationValues) -> Self {
         Self {
             mac,
-            lat: v.lat, lon: v.lon, radius: v.radius,
-            max_lat: v.max_lat, min_lat: v.min_lat, max_lon: v.max_lon, min_lon: v.min_lon,
-            h3: v.h3, samples: v.samples, weight: v.weight, source: v.source,
-            created: v.created, modified: v.modified, last_seen: v.last_seen,
-            block_first: v.block_first, block_last: v.block_last, block_count: v.block_count,
+            lat: v.lat,
+            lon: v.lon,
+            radius: v.radius,
+            max_lat: v.max_lat,
+            min_lat: v.min_lat,
+            max_lon: v.max_lon,
+            min_lon: v.min_lon,
+            h3: v.h3,
+            samples: v.samples,
+            weight: v.weight,
+            source: v.source,
+            created: v.created,
+            modified: v.modified,
+            last_seen: v.last_seen,
+            block_first: v.block_first,
+            block_last: v.block_last,
+            block_count: v.block_count,
         }
     }
 }
@@ -170,12 +182,28 @@ impl WifiWrite {
 impl CellWrite {
     fn new(c: CellKey, v: StationValues) -> Self {
         Self {
-            radio: c.radio.as_i8(), mcc: c.mcc, mnc: c.mnc, lac: c.lac, cid: c.cid,
-            lat: v.lat, lon: v.lon, radius: v.radius,
-            max_lat: v.max_lat, min_lat: v.min_lat, max_lon: v.max_lon, min_lon: v.min_lon,
-            h3: v.h3, samples: v.samples, weight: v.weight, source: v.source,
-            created: v.created, modified: v.modified, last_seen: v.last_seen,
-            block_first: v.block_first, block_last: v.block_last, block_count: v.block_count,
+            radio: c.radio.as_i8(),
+            mcc: c.mcc,
+            mnc: c.mnc,
+            lac: c.lac,
+            cid: c.cid,
+            lat: v.lat,
+            lon: v.lon,
+            radius: v.radius,
+            max_lat: v.max_lat,
+            min_lat: v.min_lat,
+            max_lon: v.max_lon,
+            min_lon: v.min_lon,
+            h3: v.h3,
+            samples: v.samples,
+            weight: v.weight,
+            source: v.source,
+            created: v.created,
+            modified: v.modified,
+            last_seen: v.last_seen,
+            block_first: v.block_first,
+            block_last: v.block_last,
+            block_count: v.block_count,
         }
     }
 }
@@ -253,13 +281,11 @@ impl CqlStore {
             builder = builder.user(user, pass);
         }
         if !cfg.address_map.is_empty() {
-            builder = builder.address_translator(std::sync::Arc::new(parse_address_map(
-                &cfg.address_map,
-            )?));
+            builder = builder
+                .address_translator(std::sync::Arc::new(parse_address_map(&cfg.address_map)?));
         }
 
-        let session =
-            builder.build().await.map_err(|e| StoreError::Unavailable(e.to_string()))?;
+        let session = builder.build().await.map_err(|e| StoreError::Unavailable(e.to_string()))?;
 
         let ttl_secs = i32::try_from(cfg.ttl_days.saturating_mul(86_400))
             .map_err(|_| StoreError::Query("ttl_days is too large for CQL".into()))?;
@@ -274,11 +300,7 @@ impl CqlStore {
         })
     }
 
-    async fn prepare_all(
-        session: &Session,
-        ttl_secs: i32,
-        cfg: &CqlCfg,
-    ) -> Result<Statements> {
+    async fn prepare_all(session: &Session, ttl_secs: i32, cfg: &CqlCfg) -> Result<Statements> {
         let read = parse_consistency(&cfg.consistency_read)?;
         let write = parse_consistency(&cfg.consistency_write)?;
 
@@ -371,9 +393,8 @@ impl CqlStore {
                     .execute_unpaged(&self.statements.select_wifi, (mac.0 as i64,))
                     .await
                     .map_err(|e| StoreError::Query(e.to_string()))?;
-                let rows = result
-                    .into_rows_result()
-                    .map_err(|e| StoreError::Malformed(e.to_string()))?;
+                let rows =
+                    result.into_rows_result().map_err(|e| StoreError::Malformed(e.to_string()))?;
                 match rows.rows::<WifiRow>() {
                     Ok(mut iter) => match iter.next() {
                         Some(Ok(row)) => Ok(Some(wifi_row_to_station(row)?)),
@@ -392,9 +413,8 @@ impl CqlStore {
                     )
                     .await
                     .map_err(|e| StoreError::Query(e.to_string()))?;
-                let rows = result
-                    .into_rows_result()
-                    .map_err(|e| StoreError::Malformed(e.to_string()))?;
+                let rows =
+                    result.into_rows_result().map_err(|e| StoreError::Malformed(e.to_string()))?;
                 match rows.rows::<CellRow>() {
                     Ok(mut iter) => match iter.next() {
                         Some(Ok(row)) => Ok(Some(cell_row_to_station(row)?)),

@@ -212,9 +212,8 @@ async fn serve(cfg: Config, in_memory: bool, with_worker: bool) -> Result<()> {
     let bind = cfg.server.bind.clone();
     let state = AppState { store, queue, cfg: Arc::new(cfg), keys };
 
-    let listener = tokio::net::TcpListener::bind(&bind)
-        .await
-        .with_context(|| format!("binding {bind}"))?;
+    let listener =
+        tokio::net::TcpListener::bind(&bind).await.with_context(|| format!("binding {bind}"))?;
     info!(address = %bind, "serving");
 
     axum::serve(listener, router(state))

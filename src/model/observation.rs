@@ -305,7 +305,11 @@ mod tests {
         // At each radio's median the weight is 1.0, which is what makes the
         // three technologies comparable to one another.
         assert_relative_eq!(cell_obs(Radio::Gsm, Some(-95)).signal_weight(), 1.0, epsilon = 1e-9);
-        assert_relative_eq!(cell_obs(Radio::Wcdma, Some(-100)).signal_weight(), 1.0, epsilon = 1e-9);
+        assert_relative_eq!(
+            cell_obs(Radio::Wcdma, Some(-100)).signal_weight(),
+            1.0,
+            epsilon = 1e-9
+        );
         assert_relative_eq!(cell_obs(Radio::Lte, Some(-105)).signal_weight(), 1.0, epsilon = 1e-9);
     }
 
@@ -329,7 +333,11 @@ mod tests {
     fn full_weight_is_the_signal_term_times_the_base_term() {
         let cfg = Validation::default();
         let o = wifi_obs();
-        assert_relative_eq!(o.weight(&cfg), o.signal_weight() * o.base_weight(&cfg), epsilon = 1e-12);
+        assert_relative_eq!(
+            o.weight(&cfg),
+            o.signal_weight() * o.base_weight(&cfg),
+            epsilon = 1e-12
+        );
     }
 
     #[test]

@@ -43,8 +43,7 @@ impl Harness {
             .await
             .unwrap();
 
-        let store =
-            Arc::new(CachedStore::new(inner, MemoryCache::new(), cfg.cache.clone()));
+        let store = Arc::new(CachedStore::new(inner, MemoryCache::new(), cfg.cache.clone()));
         let queue = Arc::new(MemoryQueue::new(cfg.ingest.shards, 10_000));
 
         let state = AppState {
@@ -285,18 +284,12 @@ async fn the_debug_route_needs_an_admin_key_and_shows_the_record() {
     h.submit(report(35.7219, 51.3347, &[("aabbccddee01", -65), ("aabbccddee02", -70)])).await;
     h.drain().await;
 
-    let refused = h
-        .server
-        .get("/debug/station/wifi/aabbccddee01")
-        .add_query_param("key", "read-only")
-        .await;
+    let refused =
+        h.server.get("/debug/station/wifi/aabbccddee01").add_query_param("key", "read-only").await;
     assert_eq!(refused.status_code().as_u16(), 400);
 
-    let allowed = h
-        .server
-        .get("/debug/station/wifi/aabbccddee01")
-        .add_query_param("key", "test-key")
-        .await;
+    let allowed =
+        h.server.get("/debug/station/wifi/aabbccddee01").add_query_param("key", "test-key").await;
     assert_eq!(allowed.status_code().as_u16(), 200);
     let body: Value = allowed.json();
     assert_eq!(body["key"], "w:aabbccddee01");

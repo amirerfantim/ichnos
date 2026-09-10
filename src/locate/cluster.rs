@@ -83,10 +83,7 @@ pub fn cluster_by_distance(
         groups.entry(uf.find(i)).or_default().push(net);
     }
 
-    groups
-        .into_values()
-        .filter(|group| group.len() >= min_in_cluster)
-        .collect()
+    groups.into_values().filter(|group| group.len() >= min_in_cluster).collect()
 }
 
 /// Group cells by the area they belong to: same radio, country, network and
@@ -343,9 +340,8 @@ mod tests {
         // obvious by eye, which is exactly why it is worth pinning.
         let points: Vec<(f64, f64)> = (0..3)
             .flat_map(|r| {
-                (0..3).map(move |c| {
-                    (35.7200 + f64::from(r) * 0.002, 51.3300 + f64::from(c) * 0.002)
-                })
+                (0..3)
+                    .map(move |c| (35.7200 + f64::from(r) * 0.002, 51.3300 + f64::from(c) * 0.002))
             })
             .collect();
         assert_groups(&points, 300.0, &[&[0, 3], &[1, 2], &[4, 5, 7, 8], &[6]]);

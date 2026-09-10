@@ -162,12 +162,7 @@ pub fn circle_radius(
     min_lat: f64,
     min_lon: f64,
 ) -> i32 {
-    let points = [
-        (min_lat, min_lon),
-        (min_lat, max_lon),
-        (max_lat, min_lon),
-        (max_lat, max_lon),
-    ];
+    let points = [(min_lat, min_lon), (min_lat, max_lon), (max_lat, min_lon), (max_lat, max_lon)];
     round_half_to_even(max_distance(lat, lon, &points)) as i32
 }
 
@@ -252,14 +247,8 @@ mod tests {
 
     #[test]
     fn circle_radius_matches_upstream_golden_values() {
-        assert_eq!(
-            circle_radius(35.7219, 51.3347, 35.7264, 51.3402, 35.7174, 51.3292),
-            705
-        );
-        assert_eq!(
-            circle_radius(35.7219, 51.3347, 35.7219, 51.3347, 35.7219, 51.3347),
-            0
-        );
+        assert_eq!(circle_radius(35.7219, 51.3347, 35.7264, 51.3402, 35.7174, 51.3292), 705);
+        assert_eq!(circle_radius(35.7219, 51.3347, 35.7219, 51.3347, 35.7219, 51.3347), 0);
     }
 
     #[test]

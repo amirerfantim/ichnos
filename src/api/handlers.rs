@@ -116,9 +116,7 @@ async fn geosubmit(
                 // The queue being down must not fail the client, who cannot do
                 // anything useful about it. The loss is counted instead.
                 tracing::warn!(error = %e, "could not queue observations");
-                m.observations
-                    .with_label_values(&["any", "dropped"])
-                    .inc_by(routed.len() as u64);
+                m.observations.with_label_values(&["any", "dropped"]).inc_by(routed.len() as u64);
             }
         }
     }
@@ -176,15 +174,10 @@ async fn geolocate(
     let today = now.date_naive();
     let (wifi_networks, cell_networks) = lookup.to_networks(&stations, &state.cfg, now, today);
 
-    m.locate_networks
-        .with_label_values(&["wifi", "known"])
-        .inc_by(wifi_networks.len() as u64);
-    m.locate_networks
-        .with_label_values(&["cell", "known"])
-        .inc_by(cell_networks.len() as u64);
+    m.locate_networks.with_label_values(&["wifi", "known"]).inc_by(wifi_networks.len() as u64);
+    m.locate_networks.with_label_values(&["cell", "known"]).inc_by(cell_networks.len() as u64);
 
-    let candidates =
-        locate::candidates(wifi_networks.clone(), cell_networks.clone(), &state.cfg);
+    let candidates = locate::candidates(wifi_networks.clone(), cell_networks.clone(), &state.cfg);
     let Some(answer) = locate::best(&candidates) else {
         m.locate_results.with_label_values(&["none"]).inc();
         return finish("geolocate", started, not_found());
@@ -197,9 +190,9 @@ async fn geolocate(
         }])
         .inc();
 
-    let explain = query.wants_explain().then(|| {
-        build_explain(&lookup, &wifi_networks, &cell_networks, &candidates, &answer)
-    });
+    let explain = query
+        .wants_explain()
+        .then(|| build_explain(&lookup, &wifi_networks, &cell_networks, &candidates, &answer));
 
     let response = LocateResponse {
         location: LatLng { lat: answer.lat, lng: answer.lon },
@@ -240,13 +233,7 @@ impl RequestNetworks {
             ) else {
                 continue;
             };
-            let key = CellKey {
-                radio,
-                mcc: mcc as i32,
-                mnc: mnc as i32,
-                lac,
-                cid,
-            };
+            let key = CellKey { radio, mcc: mcc as i32, mnc: mnc as i32, lac, cid };
             let signal = tower.signal_strength.filter(|s| *s != 0).map(|s| s as i32);
             cells.insert(key, (signal, tower.age));
         }
@@ -300,13 +287,10 @@ impl RequestNetworks {
                 key: station.key,
                 lat,
                 lon,
-                radius: f64::from(station.radius.unwrap_or(0))
-                    .max(network_cfg.min_accuracy_m),
+                radius: f64::from(station.radius.unwrap_or(0)).max(network_cfg.min_accuracy_m),
                 // Floored so a fresh scan cannot divide by zero later.
                 age_ms: reported_age.map(f64::abs).unwrap_or(0.0).max(1_000.0),
-                signal: f64::from(
-                    reported_signal.unwrap_or(network_cfg.min_signal_dbm),
-                ),
+                signal: f64::from(reported_signal.unwrap_or(network_cfg.min_signal_dbm)),
                 score: locate::score::station_score(station, now, &cfg.score),
                 seen_today: station.seen_today(today),
             };
@@ -386,8 +370,7 @@ async fn debug_station(
     Path((kind, key)): Path<(String, String)>,
     Query(query): Query<CommonQuery>,
 ) -> Response {
-    if let Err(e) = state.keys.check(&*state.store, query.key.as_deref(), Permission::Admin).await
-    {
+    if let Err(e) = state.keys.check(&*state.store, query.key.as_deref(), Permission::Admin).await {
         return auth_response(e);
     }
 
@@ -471,11 +454,7 @@ fn not_found() -> Response {
 /// A miss caused by the database being unreachable rather than by a genuine
 /// absence. The header lets a caller tell the two apart.
 fn degraded_not_found() -> Response {
-    (
-        StatusCode::NOT_FOUND,
-        [("X-Ichnos-Degraded", "1")],
-        Json(ErrorResponse::not_found()),
-    )
+    (StatusCode::NOT_FOUND, [("X-Ichnos-Degraded", "1")], Json(ErrorResponse::not_found()))
         .into_response()
 }
 
@@ -483,10 +462,7 @@ fn auth_response(error: AuthError) -> Response {
     if error.is_our_fault() {
         // Not the caller's problem, so not a 4xx. Saying "invalid key" here
         // would send whoever investigates after the wrong thing entirely.
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(ErrorResponse::invalid(error.message())),
-        )
+        return (StatusCode::SERVICE_UNAVAILABLE, Json(ErrorResponse::invalid(error.message())))
             .into_response();
     }
     (StatusCode::BAD_REQUEST, Json(ErrorResponse::forbidden(error.message()))).into_response()
@@ -502,9 +478,7 @@ fn kind_label(kind: StationKind) -> &'static str {
 /// Record the outcome and hand the response back.
 fn finish(route: &str, started: Instant, response: Response) -> Response {
     let m = metrics();
-    m.http_requests
-        .with_label_values(&[route, response.status().as_str()])
-        .inc();
+    m.http_requests.with_label_values(&[route, response.status().as_str()]).inc();
     m.http_duration.with_label_values(&[route]).observe(started.elapsed().as_secs_f64());
     response
 }
