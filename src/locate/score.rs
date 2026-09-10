@@ -88,10 +88,8 @@ mod tests {
     /// A well-established station: seen over a long period, plenty of samples,
     /// written recently.
     fn established() -> Station {
-        let mut s = Station::new(
-            StationKey::Wifi(WifiKey::parse("aabbccddeeff").unwrap()),
-            at(2026, 1, 1),
-        );
+        let mut s =
+            Station::new(StationKey::Wifi(WifiKey::parse("aabbccddeeff").unwrap()), at(2026, 1, 1));
         s.modified = at(2026, 6, 1);
         s.last_seen = Some(day(2026, 6, 1));
         s.samples = 100;
@@ -134,7 +132,7 @@ mod tests {
         assert_relative_eq!(collection_weight(&s, &cfg), 1.0, epsilon = 1e-9);
 
         s.last_seen = Some(day(2027, 6, 11));
-        assert_relative_eq!(collection_weight(&s, &cfg), 1.0, epsilon = 1e-9, );
+        assert_relative_eq!(collection_weight(&s, &cfg), 1.0, epsilon = 1e-9,);
     }
 
     #[test]
@@ -159,12 +157,14 @@ mod tests {
     fn sample_weight_is_logarithmic_and_bounded() {
         let cfg = ScoreCfg::default();
         let mut s = established();
-        for (samples, want) in [(1, 0.5), (2, 1.0), (10, LOG2_10), (100, 2.0 * LOG2_10), (1024, 10.0)] {
+        for (samples, want) in
+            [(1, 0.5), (2, 1.0), (10, LOG2_10), (100, 2.0 * LOG2_10), (1024, 10.0)]
+        {
             s.samples = samples;
             assert_relative_eq!(sample_weight(&s, &cfg), want, epsilon = 1e-3);
         }
         s.samples = 1_000_000;
-        assert_relative_eq!(sample_weight(&s, &cfg), 10.0, epsilon = 1e-9, );
+        assert_relative_eq!(sample_weight(&s, &cfg), 10.0, epsilon = 1e-9,);
         s.samples = 0;
         assert_relative_eq!(sample_weight(&s, &cfg), 0.5, epsilon = 1e-9);
     }

@@ -313,11 +313,8 @@ fn apply_position(station: &mut Station, data: &ObsData, cfg: &Config) {
 /// old position still dominates in the short term but yields to sustained new
 /// evidence.
 fn blend(station: &mut Station, data: &ObsData, cfg: &Config) {
-    let old_weight = if station.has_position() {
-        station.weight.min(cfg.station.max_old_weight)
-    } else {
-        0.0
-    };
+    let old_weight =
+        if station.has_position() { station.weight.min(cfg.station.max_old_weight) } else { 0.0 };
     let total = data.weight + old_weight;
 
     let lat = (data.lat * data.weight + station.lat.unwrap_or(0.0) * old_weight) / total;
@@ -351,11 +348,7 @@ fn h3_cell(lat: f64, lon: f64, resolution: u8) -> Option<i64> {
 
 /// The best-quality source in a batch. Lower is better.
 fn best_source(observations: &[Observation]) -> ReportSource {
-    observations
-        .iter()
-        .map(|o| o.source)
-        .min_by_key(|s| s.as_i8())
-        .unwrap_or(ReportSource::Gnss)
+    observations.iter().map(|o| o.source).min_by_key(|s| s.as_i8()).unwrap_or(ReportSource::Gnss)
 }
 
 impl ReportSource {
@@ -485,8 +478,7 @@ mod tests {
     fn agreeing_evidence_is_blended_in() {
         let cfg = Config::for_tests();
         let existing = existing_at(35.7219, 51.3347, 100.0);
-        let update =
-            fold_station(key(), &[obs_at(35.7220, 51.3348)], Some(&existing), &cfg, now());
+        let update = fold_station(key(), &[obs_at(35.7220, 51.3348)], Some(&existing), &cfg, now());
         assert_eq!(update.action, Action::Change);
         assert!(update.station.samples > existing.samples);
         assert!(update.station.weight > existing.weight);
@@ -496,10 +488,13 @@ mod tests {
     fn a_well_established_position_barely_moves_on_one_new_sighting() {
         let cfg = Config::for_tests();
         let existing = existing_at(35.7219, 51.3347, 5_000.0);
-        let update =
-            fold_station(key(), &[obs_at(35.7250, 51.3347)], Some(&existing), &cfg, now());
-        let moved = distance(existing.lat.unwrap(), existing.lon.unwrap(),
-                             update.station.lat.unwrap(), update.station.lon.unwrap());
+        let update = fold_station(key(), &[obs_at(35.7250, 51.3347)], Some(&existing), &cfg, now());
+        let moved = distance(
+            existing.lat.unwrap(),
+            existing.lon.unwrap(),
+            update.station.lat.unwrap(),
+            update.station.lon.unwrap(),
+        );
         assert!(moved < 1.0, "moved {moved:.3} m; heavy stations should be steady");
     }
 
@@ -507,10 +502,13 @@ mod tests {
     fn a_lightly_evidenced_position_moves_readily() {
         let cfg = Config::for_tests();
         let existing = existing_at(35.7219, 51.3347, 0.5);
-        let update =
-            fold_station(key(), &[obs_at(35.7250, 51.3347)], Some(&existing), &cfg, now());
-        let moved = distance(existing.lat.unwrap(), existing.lon.unwrap(),
-                             update.station.lat.unwrap(), update.station.lon.unwrap());
+        let update = fold_station(key(), &[obs_at(35.7250, 51.3347)], Some(&existing), &cfg, now());
+        let moved = distance(
+            existing.lat.unwrap(),
+            existing.lon.unwrap(),
+            update.station.lat.unwrap(),
+            update.station.lon.unwrap(),
+        );
         assert!(moved > 10.0, "moved only {moved:.3} m; weak stations should yield");
     }
 
@@ -523,8 +521,12 @@ mod tests {
         let mut heavy = existing_at(35.7219, 51.3347, 1_000_000.0);
         heavy.weight = 1_000_000.0;
         let update = fold_station(key(), &[obs_at(35.7250, 51.3347)], Some(&heavy), &cfg, now());
-        let moved = distance(heavy.lat.unwrap(), heavy.lon.unwrap(),
-                             update.station.lat.unwrap(), update.station.lon.unwrap());
+        let moved = distance(
+            heavy.lat.unwrap(),
+            heavy.lon.unwrap(),
+            update.station.lat.unwrap(),
+            update.station.lon.unwrap(),
+        );
         assert!(moved > 0.0, "the cap must leave some room to move");
     }
 
@@ -532,8 +534,7 @@ mod tests {
     fn a_station_reported_from_far_away_is_blocked() {
         let cfg = Config::for_tests();
         let existing = existing_at(35.7219, 51.3347, 100.0);
-        let update =
-            fold_station(key(), &[obs_at(36.5000, 52.0000)], Some(&existing), &cfg, now());
+        let update = fold_station(key(), &[obs_at(36.5000, 52.0000)], Some(&existing), &cfg, now());
 
         assert_eq!(update.action, Action::Block);
         assert!(!update.station.has_position(), "the position is wiped, not merely ignored");
@@ -549,8 +550,7 @@ mod tests {
         existing.block_count = 1;
         existing.block_first = Some(NaiveDate::from_ymd_opt(2026, 1, 1).unwrap());
 
-        let update =
-            fold_station(key(), &[obs_at(36.5000, 52.0000)], Some(&existing), &cfg, now());
+        let update = fold_station(key(), &[obs_at(36.5000, 52.0000)], Some(&existing), &cfg, now());
         assert_eq!(update.station.block_count, 2);
         assert_eq!(update.station.block_first, Some(NaiveDate::from_ymd_opt(2026, 1, 1).unwrap()));
         assert_eq!(update.station.block_last, Some(now().date_naive()));
@@ -564,8 +564,7 @@ mod tests {
         let mut existing = existing_at(35.7219, 51.3347, 100.0);
         existing.modified = now() - Duration::days(400);
 
-        let update =
-            fold_station(key(), &[obs_at(36.5000, 52.0000)], Some(&existing), &cfg, now());
+        let update = fold_station(key(), &[obs_at(36.5000, 52.0000)], Some(&existing), &cfg, now());
         assert_eq!(update.action, Action::Replace);
         assert!(update.station.has_position());
         assert_eq!(update.station.block_count, 0, "and it is not held against the station");
@@ -629,8 +628,7 @@ mod tests {
     fn the_bounding_box_only_ever_grows() {
         let cfg = Config::for_tests();
         let existing = existing_at(35.7219, 51.3347, 100.0);
-        let update =
-            fold_station(key(), &[obs_at(35.7300, 51.3400)], Some(&existing), &cfg, now());
+        let update = fold_station(key(), &[obs_at(35.7300, 51.3400)], Some(&existing), &cfg, now());
 
         assert!(update.station.max_lat.unwrap() >= existing.max_lat.unwrap());
         assert!(update.station.min_lat.unwrap() <= existing.min_lat.unwrap());

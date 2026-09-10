@@ -172,10 +172,7 @@ mod tests {
     async fn a_missing_key_is_refused_distinctly_from_a_wrong_one() {
         let store = store_with(ApiKey::full("good")).await;
         let cache = KeyCache::new(&cfg());
-        assert_eq!(
-            cache.check(&store, None, Permission::Locate).await,
-            Err(AuthError::Missing)
-        );
+        assert_eq!(cache.check(&store, None, Permission::Locate).await, Err(AuthError::Missing));
         assert_eq!(
             cache.check(&store, Some(""), Permission::Locate).await,
             Err(AuthError::Missing)

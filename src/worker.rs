@@ -144,7 +144,13 @@ pub struct Worker<Q: Queue + ?Sized, S: Store + ?Sized, L: Leases + ?Sized> {
 }
 
 impl<Q: Queue + ?Sized, S: Store + ?Sized, L: Leases + ?Sized> Worker<Q, S, L> {
-    pub fn new(queue: Arc<Q>, store: Arc<S>, leases: Arc<L>, cfg: Config, identity: String) -> Self {
+    pub fn new(
+        queue: Arc<Q>,
+        store: Arc<S>,
+        leases: Arc<L>,
+        cfg: Config,
+        identity: String,
+    ) -> Self {
         Self { queue, store, leases, cfg, identity, held: HashSet::new() }
     }
 
@@ -316,10 +322,8 @@ mod tests {
     }
 
     async fn publish(queue: &MemoryQueue, cfg: &Config, observations: Vec<Observation>) {
-        let routed: Vec<(u32, Observation)> = observations
-            .into_iter()
-            .map(|o| (o.key.shard(cfg.ingest.shards), o))
-            .collect();
+        let routed: Vec<(u32, Observation)> =
+            observations.into_iter().map(|o| (o.key.shard(cfg.ingest.shards), o)).collect();
         queue.publish(&routed).await.unwrap();
     }
 
@@ -451,7 +455,8 @@ mod tests {
         let store = Arc::new(MemoryStore::new());
         let leases = Arc::new(MemoryLeases::new());
 
-        let mut a = Worker::new(queue.clone(), store.clone(), leases.clone(), cfg.clone(), "a".into());
+        let mut a =
+            Worker::new(queue.clone(), store.clone(), leases.clone(), cfg.clone(), "a".into());
         let mut b = Worker::new(queue, store, leases, cfg, "b".into());
 
         a.claim_shards().await.unwrap();

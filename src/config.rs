@@ -172,11 +172,7 @@ impl Default for Validation {
             mcc: (1, 999),
             mnc: (0, 999),
             mcc_allowlist: vec![],
-            invalid_macs: vec![
-                "000000000000".into(),
-                "ffffffffffff".into(),
-                "01005e901000".into(),
-            ],
+            invalid_macs: vec!["000000000000".into(), "ffffffffffff".into(), "01005e901000".into()],
         }
     }
 }
@@ -460,10 +456,8 @@ impl Config {
         let defaults = Config { locate: Locate::default_pair(), ..Default::default() };
         let defaults_toml =
             toml::to_string(&defaults).map_err(|e| ConfigError::Invalid(e.to_string()))?;
-        builder = builder.add_source(config::File::from_str(
-            &defaults_toml,
-            config::FileFormat::Toml,
-        ));
+        builder =
+            builder.add_source(config::File::from_str(&defaults_toml, config::FileFormat::Toml));
 
         if let Some(p) = path {
             builder = builder.add_source(config::File::from(p).required(true));

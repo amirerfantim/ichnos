@@ -130,8 +130,7 @@ impl<S: Store, C: CacheBackend> Store for CachedStore<S, C> {
 
         // Write back both outcomes: what was found, and what turned out not to
         // exist. The second is the whole point of this cache.
-        let by_key: HashMap<StationKey, &Station> =
-            fetched.iter().map(|s| (s.key, s)).collect();
+        let by_key: HashMap<StationKey, &Station> = fetched.iter().map(|s| (s.key, s)).collect();
         let mut writes: Vec<(String, String, u64)> = Vec::with_capacity(to_fetch.len());
         for key in &to_fetch {
             match by_key.get(key) {
@@ -140,9 +139,11 @@ impl<S: Store, C: CacheBackend> Store for CachedStore<S, C> {
                         writes.push((Self::cache_key(key), json, self.cfg.hit_ttl_secs));
                     }
                 }
-                None => {
-                    writes.push((Self::cache_key(key), NEGATIVE.to_string(), self.cfg.miss_ttl_secs))
-                }
+                None => writes.push((
+                    Self::cache_key(key),
+                    NEGATIVE.to_string(),
+                    self.cfg.miss_ttl_secs,
+                )),
             }
         }
         self.backend.set_many(&writes).await;

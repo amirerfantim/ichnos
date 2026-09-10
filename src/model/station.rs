@@ -133,10 +133,7 @@ mod tests {
     }
 
     fn station() -> Station {
-        Station::new(
-            StationKey::Wifi(WifiKey::parse("aabbccddeeff").unwrap()),
-            at(2026, 1, 1),
-        )
+        Station::new(StationKey::Wifi(WifiKey::parse("aabbccddeeff").unwrap()), at(2026, 1, 1))
     }
 
     #[test]
