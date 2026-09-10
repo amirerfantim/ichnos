@@ -1,0 +1,63 @@
+[package]
+name = "ichnos"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+description = "Geolocation service: WiFi and cell tower positioning with an Ichnaea-compatible API"
+license = "Apache-2.0"
+repository = "https://github.com/amirerfantim/ichnos"
+readme = "README.md"
+keywords = ["geolocation", "wifi", "cell", "positioning", "scylladb"]
+categories = ["science::geo", "web-programming::http-server"]
+
+[dependencies]
+# runtime
+tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "signal", "time", "sync"] }
+futures = "0.3"
+async-trait = "0.1"
+
+# http
+axum = "0.8"
+tower-http = { version = "0.7", features = ["trace", "timeout"] }
+
+# storage
+scylla = "1.8"
+redis = { version = "1.7", features = ["tokio-comp", "connection-manager"] }
+
+# math: these mirror what Ichnaea uses in Python
+kodama = "0.3"                 # scipy.cluster.hierarchy  (complete linkage)
+levenberg-marquardt = "0.15"   # scipy.optimize.leastsq   (MINPACK LM)
+nalgebra = "0.35"              # numpy
+h3o = "0.11"                   # spatial index cell
+
+# serialisation and config
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+config = { version = "0.15", default-features = false, features = ["toml"] }
+toml = "0.9"
+
+# observability
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+prometheus = { version = "0.14", default-features = false }
+
+# odds and ends
+clap = { version = "4", features = ["derive"] }
+chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
+thiserror = "2"
+anyhow = "1"
+hex = "0.4"
+rand = "0.10"
+
+[dev-dependencies]
+tokio = { version = "1.53", features = ["full", "test-util"] }
+axum-test = "18"
+approx = "0.5"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
+
+[lints.rust]
+unsafe_code = "forbid"
