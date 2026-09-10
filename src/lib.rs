@@ -13,3 +13,4 @@ pub mod locate;
 pub mod model;
 
 pub use config::Config;
+pub mod store;
