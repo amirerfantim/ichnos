@@ -9,6 +9,7 @@
 
 pub mod config;
 pub mod geo;
+pub mod locate;
 pub mod model;
 
 pub use config::Config;

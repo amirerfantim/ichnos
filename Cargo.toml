@@ -25,9 +25,7 @@ scylla = "1.8"
 redis = { version = "1.7", features = ["tokio-comp", "connection-manager"] }
 
 # math: these mirror what Ichnaea uses in Python
-kodama = "0.3"                 # scipy.cluster.hierarchy  (complete linkage)
-levenberg-marquardt = "0.15"   # scipy.optimize.leastsq   (MINPACK LM)
-nalgebra = "0.35"              # numpy
+kodama = "0.3"                 # complete-linkage clustering, as scipy.cluster.hierarchy does
 h3o = "0.11"                   # spatial index cell
 
 # serialisation and config
