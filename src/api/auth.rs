@@ -21,6 +21,12 @@ pub enum AuthError {
     Unknown,
     /// A known key that may not do this particular thing.
     NotPermitted,
+    /// The key could not be checked, because storage is unreachable.
+    ///
+    /// Distinct from [`AuthError::Unknown`] on purpose. Telling a caller with a
+    /// perfectly good key that it is invalid sends whoever investigates in
+    /// exactly the wrong direction.
+    Unavailable,
 }
 
 impl AuthError {
@@ -29,7 +35,13 @@ impl AuthError {
             AuthError::Missing => "No API key was supplied",
             AuthError::Unknown => "Invalid API key",
             AuthError::NotPermitted => "This API key may not use this endpoint",
+            AuthError::Unavailable => "Could not verify the API key: storage is unavailable",
         }
+    }
+
+    /// Whether this is the caller's fault or ours.
+    pub fn is_our_fault(self) -> bool {
+        matches!(self, AuthError::Unavailable)
     }
 }
 
@@ -73,7 +85,7 @@ impl KeyCache {
         }
 
         let key = key.filter(|k| !k.is_empty()).ok_or(AuthError::Missing)?;
-        let found = self.lookup(store, key).await;
+        let found = self.lookup(store, key).await?;
 
         let api_key = found.ok_or(AuthError::Unknown)?;
         if !api_key.enabled {
@@ -91,15 +103,22 @@ impl KeyCache {
         Ok(Some(api_key))
     }
 
-    async fn lookup<S: Store + ?Sized>(&self, store: &S, key: &str) -> Option<ApiKey> {
+    async fn lookup<S: Store + ?Sized>(
+        &self,
+        store: &S,
+        key: &str,
+    ) -> Result<Option<ApiKey>, AuthError> {
+        // A key checked recently keeps working through an outage. That is the
+        // point of the cache here: a storage problem should not lock out the
+        // callers who were already using the service.
         if let Some(cached) = self.cached(key) {
-            return cached;
+            return Ok(cached);
         }
         // A store failure caches nothing, so the next request tries again
         // rather than being locked out for the whole cache lifetime.
-        let found = store.get_api_key(key).await.ok()?;
+        let found = store.get_api_key(key).await.map_err(|_| AuthError::Unavailable)?;
         self.remember(key, found.clone());
-        found
+        Ok(found)
     }
 
     fn cached(&self, key: &str) -> Option<Option<ApiKey>> {
@@ -242,17 +261,35 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_store_failure_does_not_lock_a_caller_out_for_the_whole_cache_lifetime() {
+    async fn a_storage_outage_is_reported_as_ours_not_as_a_bad_key() {
+        // Telling a caller with a perfectly good key that it is invalid sends
+        // whoever investigates in exactly the wrong direction.
         let store = store_with(ApiKey::full("good")).await;
         let cache = KeyCache::new(&cfg());
 
         store.set_failing(true);
-        assert!(cache.check(&store, Some("good"), Permission::Locate).await.is_err());
+        let error = cache.check(&store, Some("good"), Permission::Locate).await.unwrap_err();
+        assert_eq!(error, AuthError::Unavailable);
+        assert!(error.is_our_fault());
 
         store.set_failing(false);
         assert!(
             cache.check(&store, Some("good"), Permission::Locate).await.is_ok(),
             "the failure must not have been cached"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_caller_already_using_the_service_survives_an_outage() {
+        let store = store_with(ApiKey::full("busy")).await;
+        let cache = KeyCache::new(&cfg());
+
+        cache.check(&store, Some("busy"), Permission::Locate).await.unwrap();
+        store.set_failing(true);
+
+        assert!(
+            cache.check(&store, Some("busy"), Permission::Locate).await.is_ok(),
+            "a key checked moments ago should keep working"
         );
     }
 
