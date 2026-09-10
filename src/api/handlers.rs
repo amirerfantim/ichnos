@@ -480,6 +480,15 @@ fn degraded_not_found() -> Response {
 }
 
 fn auth_response(error: AuthError) -> Response {
+    if error.is_our_fault() {
+        // Not the caller's problem, so not a 4xx. Saying "invalid key" here
+        // would send whoever investigates after the wrong thing entirely.
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorResponse::invalid(error.message())),
+        )
+            .into_response();
+    }
     (StatusCode::BAD_REQUEST, Json(ErrorResponse::forbidden(error.message()))).into_response()
 }
 
