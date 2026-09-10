@@ -120,11 +120,7 @@ impl Metrics {
             ),
             fold_ratio,
             db_batch_seconds,
-            cache_events: counter_vec(
-                "ichnos_cache_total",
-                "Cache lookups by result",
-                &["result"],
-            ),
+            cache_events: counter_vec("ichnos_cache_total", "Cache lookups by result", &["result"]),
             locate_results: counter_vec(
                 "ichnos_locate_total",
                 "Locate requests by which source answered",

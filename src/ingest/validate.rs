@@ -144,10 +144,7 @@ fn check_position(
         return Err(DropReason::PositionOutOfRange);
     }
     if let Some(accuracy) = position.accuracy {
-        if !accuracy.is_finite()
-            || accuracy < cfg.min_accuracy_m
-            || accuracy > cfg.max_accuracy_m
-        {
+        if !accuracy.is_finite() || accuracy < cfg.min_accuracy_m || accuracy > cfg.max_accuracy_m {
             return Err(DropReason::AccuracyOutOfRange);
         }
     }
@@ -157,10 +154,7 @@ fn check_position(
         }
     }
     if let Some(age) = position.age {
-        if !age.is_finite()
-            || age < cfg.min_age_ms as f64
-            || age > cfg.max_age_ms as f64
-        {
+        if !age.is_finite() || age < cfg.min_age_ms as f64 || age > cfg.max_age_ms as f64 {
             return Err(DropReason::AgeOutOfRange);
         }
     }
@@ -213,15 +207,9 @@ fn validate_wifi(
     Ok((key, signal))
 }
 
-fn validate_cell(
-    cell: &CellTower,
-    cfg: &Validation,
-) -> Result<(CellKey, Option<i32>), DropReason> {
-    let radio = cell
-        .radio_type
-        .as_deref()
-        .and_then(Radio::parse)
-        .ok_or(DropReason::UnknownRadio)?;
+fn validate_cell(cell: &CellTower, cfg: &Validation) -> Result<(CellKey, Option<i32>), DropReason> {
+    let radio =
+        cell.radio_type.as_deref().and_then(Radio::parse).ok_or(DropReason::UnknownRadio)?;
 
     let mcc = i32::try_from(cell.mobile_country_code.ok_or(DropReason::CellFieldOutOfRange)?)
         .map_err(|_| DropReason::CellFieldOutOfRange)?;
@@ -252,11 +240,8 @@ fn validate_cell(
     }
 
     if let Some(psc) = cell.primary_scrambling_code {
-        let psc_max = if radio == Radio::Lte {
-            i64::from(cfg.psc_lte_max)
-        } else {
-            i64::from(cfg.psc.1)
-        };
+        let psc_max =
+            if radio == Radio::Lte { i64::from(cfg.psc_lte_max) } else { i64::from(cfg.psc.1) };
         if psc != 0 && (psc < i64::from(cfg.psc.0) || psc > psc_max) {
             return Err(DropReason::CellFieldOutOfRange);
         }
@@ -360,10 +345,7 @@ mod tests {
             ("latitude off the map", ApiPosition { latitude: Some(91.0), ..good_position() }),
             ("longitude off the map", ApiPosition { longitude: Some(200.0), ..good_position() }),
             ("not a number", ApiPosition { latitude: Some(f64::NAN), ..good_position() }),
-            (
-                "impossible accuracy",
-                ApiPosition { accuracy: Some(2_000_000.0), ..good_position() },
-            ),
+            ("impossible accuracy", ApiPosition { accuracy: Some(2_000_000.0), ..good_position() }),
             ("faster than sound", ApiPosition { speed: Some(400.0), ..good_position() }),
         ] {
             let mut bad = item();
@@ -411,10 +393,8 @@ mod tests {
     fn a_signal_of_zero_means_not_measured_rather_than_extraordinary() {
         let mut zeroed = item();
         zeroed.cell_towers.clear();
-        zeroed.wifi_access_points = vec![WifiAccessPoint {
-            signal_strength: Some(0),
-            ..good_wifi("aabbccddeeff")
-        }];
+        zeroed.wifi_access_points =
+            vec![WifiAccessPoint { signal_strength: Some(0), ..good_wifi("aabbccddeeff") }];
         let out = validate_item(&zeroed, &Validation::default());
         assert_eq!(out.observations.len(), 1);
         assert_eq!(out.observations[0].signal, None);
@@ -446,7 +426,8 @@ mod tests {
     fn an_unknown_radio_drops_the_cell() {
         let mut bad = item();
         bad.wifi_access_points.clear();
-        bad.cell_towers = vec![CellTower { radio_type: Some("smoke signals".into()), ..good_cell() }];
+        bad.cell_towers =
+            vec![CellTower { radio_type: Some("smoke signals".into()), ..good_cell() }];
         assert_eq!(
             validate_item(&bad, &Validation::default()).dropped,
             vec![DropReason::UnknownRadio]
@@ -548,7 +529,10 @@ mod tests {
     fn the_report_source_is_read_when_given_and_assumed_otherwise() {
         let mut typed = item();
         typed.position = Some(ApiPosition { source: Some("query".into()), ..good_position() });
-        assert_eq!(validate_item(&typed, &Validation::default()).observations[0].source, ReportSource::Query);
+        assert_eq!(
+            validate_item(&typed, &Validation::default()).observations[0].source,
+            ReportSource::Query
+        );
 
         assert_eq!(
             validate_item(&item(), &Validation::default()).observations[0].source,

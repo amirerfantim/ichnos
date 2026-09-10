@@ -188,9 +188,7 @@ impl Queue for RedisQueue {
             accepted += 1;
         }
 
-        pipe.query_async::<()>(&mut conn)
-            .await
-            .map_err(|e| QueueError::Failed(e.to_string()))?;
+        pipe.query_async::<()>(&mut conn).await.map_err(|e| QueueError::Failed(e.to_string()))?;
         Ok(accepted)
     }
 
@@ -338,12 +336,7 @@ impl RedisLeases {
 
 #[async_trait]
 impl Leases for RedisLeases {
-    async fn acquire(
-        &self,
-        shard: u32,
-        owner: &str,
-        ttl: Duration,
-    ) -> Result<bool, LeaseError> {
+    async fn acquire(&self, shard: u32, owner: &str, ttl: Duration) -> Result<bool, LeaseError> {
         let mut conn = self.conn.clone();
         // Re-acquiring a shard this worker already holds is a renewal, so try
         // that first rather than reporting a conflict with itself.

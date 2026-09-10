@@ -108,8 +108,7 @@ pub async fn run(cfg: &Config, input: &Path, output: Option<&Path>) -> Result<()
     let (report, store) = replay_lines(text.lines().map(str::to_string), cfg).await?;
 
     if let Some(path) = output {
-        let mut file =
-            std::fs::File::create(path).with_context(|| format!("creating {path:?}"))?;
+        let mut file = std::fs::File::create(path).with_context(|| format!("creating {path:?}"))?;
         for station in store.snapshot() {
             writeln!(file, "{}", serde_json::to_string(&station)?)?;
         }
@@ -178,8 +177,7 @@ mod tests {
     #[tokio::test]
     async fn repeated_sightings_fold_and_the_ratio_says_so() {
         let cfg = Config::for_tests();
-        let lines: Vec<String> =
-            (0..20).map(|_| body("aabbccddeeff", 35.7219, 51.3347)).collect();
+        let lines: Vec<String> = (0..20).map(|_| body("aabbccddeeff", 35.7219, 51.3347)).collect();
         let (report, store) = replay_lines(lines.into_iter(), &cfg).await.unwrap();
 
         assert_eq!(report.observations, 20);
@@ -206,8 +204,7 @@ mod tests {
     async fn changing_a_setting_changes_the_outcome_measurably() {
         // This is what the harness is for: run the same traffic twice and read
         // the difference off the report.
-        let lines: Vec<String> =
-            (0..10).map(|_| body("aabbccddeeff", 35.7219, 51.3347)).collect();
+        let lines: Vec<String> = (0..10).map(|_| body("aabbccddeeff", 35.7219, 51.3347)).collect();
 
         let mut with_elision = Config::for_tests();
         with_elision.elision.enabled = true;

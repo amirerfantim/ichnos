@@ -132,7 +132,8 @@ impl Queue for MemoryQueue {
         self.check()?;
         let mut shards = self.shards.lock().expect("queue lock poisoned");
         let queue = &mut shards[shard as usize];
-        let taken: Vec<Entry> = (0..max.min(queue.len())).filter_map(|_| queue.pop_front()).collect();
+        let taken: Vec<Entry> =
+            (0..max.min(queue.len())).filter_map(|_| queue.pop_front()).collect();
         drop(shards);
 
         self.pending.lock().expect("queue lock poisoned")[shard as usize]

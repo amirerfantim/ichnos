@@ -283,7 +283,10 @@ mod tests {
     #[test]
     fn a_single_cell_reports_its_own_position_and_radius() {
         let cfg = Config::for_tests();
-        let p = aggregate_cell_cluster(vec![cell_net(1, 1, 35.70, 51.30, 2.0, 3_000.0)], &cfg.locate.cell);
+        let p = aggregate_cell_cluster(
+            vec![cell_net(1, 1, 35.70, 51.30, 2.0, 3_000.0)],
+            &cfg.locate.cell,
+        );
         assert_eq!((p.lat, p.lon), (35.70, 51.30));
         assert_eq!(p.accuracy, 3_000.0);
         assert_eq!(p.source, PositionSource::Cell);
@@ -292,10 +295,13 @@ mod tests {
     #[test]
     fn a_single_cell_radius_is_clamped_to_the_cell_range() {
         let cfg = Config::for_tests();
-        let tiny = aggregate_cell_cluster(vec![cell_net(1, 1, 35.7, 51.3, 1.0, 5.0)], &cfg.locate.cell);
+        let tiny =
+            aggregate_cell_cluster(vec![cell_net(1, 1, 35.7, 51.3, 1.0, 5.0)], &cfg.locate.cell);
         assert_eq!(tiny.accuracy, 1_000.0, "a cell is never as precise as 5 m");
-        let huge =
-            aggregate_cell_cluster(vec![cell_net(1, 1, 35.7, 51.3, 1.0, 9_000_000.0)], &cfg.locate.cell);
+        let huge = aggregate_cell_cluster(
+            vec![cell_net(1, 1, 35.7, 51.3, 1.0, 9_000_000.0)],
+            &cfg.locate.cell,
+        );
         assert_eq!(huge.accuracy, 50_000.0);
     }
 

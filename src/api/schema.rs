@@ -273,7 +273,8 @@ mod tests {
 
     #[test]
     fn missing_lists_default_to_empty_rather_than_failing() {
-        let item: SubmitItem = serde_json::from_str(r#"{"position":{"latitude":1,"longitude":2}}"#).unwrap();
+        let item: SubmitItem =
+            serde_json::from_str(r#"{"position":{"latitude":1,"longitude":2}}"#).unwrap();
         assert!(item.cell_towers.is_empty());
         assert!(item.wifi_access_points.is_empty());
     }
@@ -281,7 +282,8 @@ mod tests {
     #[test]
     fn integers_are_accepted_where_floats_are_expected() {
         // Clients send whole numbers without a decimal point.
-        let p: Position = serde_json::from_str(r#"{"latitude":35,"longitude":51,"accuracy":10}"#).unwrap();
+        let p: Position =
+            serde_json::from_str(r#"{"latitude":35,"longitude":51,"accuracy":10}"#).unwrap();
         assert_eq!(p.latitude, Some(35.0));
         assert_eq!(p.accuracy, Some(10.0));
     }

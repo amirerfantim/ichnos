@@ -1,0 +1,56 @@
+# Ichnos configuration.
+#
+# Everything here has a default; a file only needs the values it changes.
+# Environment variables override the file: ICHNOS__INGEST__SHARDS=64.
+# Run `ichnos show-config` to see what the settings actually resolved to.
+
+[server]
+bind = "0.0.0.0:8080"
+request_timeout_ms = 2000
+
+[cql]
+nodes = ["scylla:9042"]
+keyspace = "ichnos"
+# A single-node development cluster cannot reach a quorum, so use ONE there.
+consistency_write = "LOCAL_QUORUM"
+consistency_read = "LOCAL_ONE"
+# Row lifetime, refreshed by every write. This is what bounds the dataset, and
+# it replaces a cleanup job entirely.
+ttl_days = 180
+
+# Only needed when nodes advertise addresses this process cannot reach, such as
+# through a forwarded port or behind NAT.
+# [cql.address_map]
+# "10.0.0.5:9042" = "127.0.0.1:9042"
+
+[redis]
+cache_url = "redis://redis-cache:6379/0"
+queue_url = "redis://redis-queue:6379/0"
+
+[ingest]
+shards = 32
+fold_window_secs = 45
+stream_maxlen = 200000
+
+[lease]
+ttl_secs = 15
+renew_secs = 5
+
+[elision]
+enabled = true
+min_move_m = 1.0
+
+[cache]
+enabled = true
+hit_ttl_secs = 300
+miss_ttl_secs = 60
+
+[block]
+temporary_days = 7
+# One forgiven block per this many days of known age. Upstream uses 30, which
+# is where the familiar 45-day recovery comes from.
+budget_days = 10
+
+[api]
+max_networks = 20
+require_keys = true
