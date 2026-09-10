@@ -252,6 +252,11 @@ impl CqlStore {
         if let (Some(user), Some(pass)) = (&cfg.username, &cfg.password) {
             builder = builder.user(user, pass);
         }
+        if !cfg.address_map.is_empty() {
+            builder = builder.address_translator(std::sync::Arc::new(parse_address_map(
+                &cfg.address_map,
+            )?));
+        }
 
         let session =
             builder.build().await.map_err(|e| StoreError::Unavailable(e.to_string()))?;
@@ -566,6 +571,28 @@ impl Store for CqlStore {
     }
 }
 
+/// Build the driver's address rewrite table.
+///
+/// Both sides must be `host:port`; a bare host would be ambiguous about which
+/// port it meant, and silently guessing would produce a timeout far from its
+/// cause.
+fn parse_address_map(
+    map: &std::collections::BTreeMap<String, String>,
+) -> Result<std::collections::HashMap<std::net::SocketAddr, std::net::SocketAddr>> {
+    let mut out = std::collections::HashMap::new();
+    for (from, to) in map {
+        let parse = |value: &str| -> Result<std::net::SocketAddr> {
+            value.parse::<std::net::SocketAddr>().map_err(|_| {
+                StoreError::Query(format!(
+                    "cql.address_map entries must be host:port, but got {value:?}"
+                ))
+            })
+        };
+        out.insert(parse(from)?, parse(to)?);
+    }
+    Ok(out)
+}
+
 fn placeholders(n: usize) -> String {
     std::iter::repeat_n("?", n).collect::<Vec<_>>().join(", ")
 }
@@ -662,6 +689,30 @@ fn cell_row_to_station(row: CellRow) -> Result<Station> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_address_map_is_parsed_into_socket_addresses() {
+        let mut map = std::collections::BTreeMap::new();
+        map.insert("10.0.0.5:9042".to_string(), "127.0.0.1:9042".to_string());
+        let parsed = parse_address_map(&map).unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(
+            parsed[&"10.0.0.5:9042".parse::<std::net::SocketAddr>().unwrap()],
+            "127.0.0.1:9042".parse::<std::net::SocketAddr>().unwrap()
+        );
+    }
+
+    #[test]
+    fn an_address_without_a_port_is_refused_rather_than_guessed_at() {
+        let mut map = std::collections::BTreeMap::new();
+        map.insert("10.0.0.5".to_string(), "127.0.0.1:9042".to_string());
+        assert!(parse_address_map(&map).is_err());
+    }
+
+    #[test]
+    fn an_empty_address_map_parses_to_nothing() {
+        assert!(parse_address_map(&std::collections::BTreeMap::new()).unwrap().is_empty());
+    }
 
     #[test]
     fn placeholder_lists_have_the_right_shape() {
