@@ -10,7 +10,7 @@
 //! A cache failure must never fail a request. Every error here is counted and
 //! swallowed, and the call falls through to the real store.
 
-use super::{ApiKey, Result, Station, Store, StoreError};
+use super::{ApiKey, Result, Station, Store};
 use crate::config::Cache as CacheCfg;
 use crate::model::{StationKey, StationKind};
 use async_trait::async_trait;

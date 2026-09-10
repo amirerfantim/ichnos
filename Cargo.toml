@@ -21,7 +21,7 @@ axum = "0.8"
 tower-http = { version = "0.7", features = ["trace", "timeout"] }
 
 # storage
-scylla = "1.8"
+scylla = { version = "1.8", features = ["chrono-04"] }
 redis = { version = "1.7", features = ["tokio-comp", "connection-manager"] }
 
 # math: these mirror what Ichnaea uses in Python
