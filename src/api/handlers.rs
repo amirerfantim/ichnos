@@ -1,6 +1,7 @@
 //! The HTTP surface: two endpoints clients use, and a few for operators.
 
 use crate::api::auth::{AuthError, KeyCache, Permission};
+use crate::api::quota::{consume, QuotaCounter, QuotaVerdict};
 use crate::api::schema::*;
 use crate::config::Config;
 use crate::ingest::queue::Queue;
@@ -27,6 +28,7 @@ pub struct AppState {
     pub queue: Arc<dyn Queue>,
     pub cfg: Arc<Config>,
     pub keys: Arc<KeyCache>,
+    pub quota: Arc<dyn QuotaCounter>,
 }
 
 /// Query parameters both endpoints accept.
@@ -71,9 +73,13 @@ async fn geosubmit(
     let started = Instant::now();
     let m = metrics();
 
-    if let Err(e) = state.keys.check(&*state.store, query.key.as_deref(), Permission::Submit).await
-    {
-        return finish("geosubmit", started, auth_response(e));
+    let api_key =
+        match state.keys.check(&*state.store, query.key.as_deref(), Permission::Submit).await {
+            Ok(key) => key,
+            Err(e) => return finish("geosubmit", started, auth_response(e)),
+        };
+    if over_quota(&state, api_key.as_ref()).await {
+        return finish("geosubmit", started, quota_response());
     }
 
     let Ok(Json(request)) = body else {
@@ -135,9 +141,13 @@ async fn geolocate(
     let started = Instant::now();
     let m = metrics();
 
-    if let Err(e) = state.keys.check(&*state.store, query.key.as_deref(), Permission::Locate).await
-    {
-        return finish("geolocate", started, auth_response(e));
+    let api_key =
+        match state.keys.check(&*state.store, query.key.as_deref(), Permission::Locate).await {
+            Ok(key) => key,
+            Err(e) => return finish("geolocate", started, auth_response(e)),
+        };
+    if over_quota(&state, api_key.as_ref()).await {
+        return finish("geolocate", started, quota_response());
     }
 
     let Ok(Json(request)) = body else {
@@ -455,6 +465,26 @@ fn not_found() -> Response {
 /// absence. The header lets a caller tell the two apart.
 fn degraded_not_found() -> Response {
     (StatusCode::NOT_FOUND, [("X-Ichnos-Degraded", "1")], Json(ErrorResponse::not_found()))
+        .into_response()
+}
+
+/// Has this key had its allowance for today?
+async fn over_quota(state: &AppState, api_key: Option<&crate::store::ApiKey>) -> bool {
+    match api_key {
+        Some(key) => {
+            consume(&*state.quota, &key.key, key.daily_quota).await == QuotaVerdict::Exceeded
+        }
+        // No key means keys are not being required at all, which is a
+        // development setting; there is nothing to count against.
+        None => false,
+    }
+}
+
+fn quota_response() -> Response {
+    (
+        StatusCode::TOO_MANY_REQUESTS,
+        Json(ErrorResponse::forbidden("Daily request allowance exhausted")),
+    )
         .into_response()
 }
 

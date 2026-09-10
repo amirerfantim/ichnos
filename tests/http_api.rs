@@ -8,6 +8,7 @@
 use axum_test::TestServer;
 use ichnos::api::auth::KeyCache;
 use ichnos::api::handlers::{router, AppState};
+use ichnos::api::quota::MemoryQuota;
 use ichnos::config::Config;
 use ichnos::ingest::queue::MemoryQueue;
 use ichnos::store::cache::{CachedStore, MemoryCache};
@@ -51,6 +52,7 @@ impl Harness {
             queue: queue.clone(),
             cfg: Arc::new(cfg.clone()),
             keys: Arc::new(KeyCache::new(&cfg.api)),
+            quota: Arc::new(MemoryQuota::new()),
         };
 
         Self { server: TestServer::new(router(state)).unwrap(), queue, store, cfg }
@@ -439,5 +441,42 @@ async fn more_networks_than_the_limit_are_ignored_rather_than_refused() {
 impl Harness {
     async fn new_with(cfg: Config) -> Self {
         Self::with_config(cfg).await
+    }
+}
+
+#[tokio::test]
+async fn a_key_is_refused_once_it_has_had_its_daily_allowance() {
+    let cfg = Config::for_tests();
+    let inner = MemoryStore::new();
+    inner.put_api_key(&ApiKey { daily_quota: 3, ..ApiKey::full("small-quota") }).await.unwrap();
+    let store = Arc::new(CachedStore::new(inner, MemoryCache::new(), cfg.cache.clone()));
+    let state = AppState {
+        store,
+        queue: Arc::new(MemoryQueue::new(cfg.ingest.shards, 1_000)),
+        cfg: Arc::new(cfg.clone()),
+        keys: Arc::new(KeyCache::new(&cfg.api)),
+        quota: Arc::new(MemoryQuota::new()),
+    };
+    let server = TestServer::new(router(state)).unwrap();
+
+    for i in 1..=3 {
+        let response = server
+            .post("/v1/geolocate")
+            .add_query_param("key", "small-quota")
+            .json(&json!({}))
+            .await;
+        assert_eq!(response.status_code().as_u16(), 404, "request {i} should be served");
+    }
+
+    let refused =
+        server.post("/v1/geolocate").add_query_param("key", "small-quota").json(&json!({})).await;
+    assert_eq!(refused.status_code().as_u16(), 429);
+}
+
+#[tokio::test]
+async fn a_key_without_a_quota_is_never_refused() {
+    let h = Harness::new().await;
+    for _ in 0..50 {
+        assert_eq!(h.locate(json!({})).await.0, 404, "no allowance means no ceiling");
     }
 }
