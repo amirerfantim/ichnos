@@ -12,8 +12,9 @@
 use crate::config::Config;
 use crate::ingest::elide::{self, Write};
 use crate::ingest::fold::{self, Action};
-use crate::ingest::lease::Leases;
+use crate::ingest::lease::{fair_share, Leases};
 use crate::ingest::queue::{Entry, Queue};
+use crate::metrics;
 use crate::model::{Station, StationKey};
 use crate::store::Store;
 use chrono::Utc;
@@ -160,14 +161,61 @@ impl<Q: Queue + ?Sized, S: Store + ?Sized, L: Leases + ?Sized> Worker<Q, S, L> {
         shards
     }
 
-    /// Claim any shard nobody holds, up to the configured limit.
+    /// How many shards this worker should be holding right now.
+    ///
+    /// An explicit limit wins. Otherwise it is an equal split across the
+    /// workers that have announced themselves, which is what lets a new worker
+    /// take up work without waiting for an old one to die.
+    pub async fn target_shards(&self) -> Result<u32, WorkerError> {
+        if self.cfg.lease.max_shards_per_worker > 0 {
+            return Ok(self.cfg.lease.max_shards_per_worker);
+        }
+        let ttl = Duration::from_secs(self.cfg.lease.ttl_secs);
+        let workers =
+            self.leases.live_workers(ttl).await.map_err(|e| WorkerError::Lease(e.to_string()))?;
+        Ok(fair_share(self.cfg.ingest.shards, workers))
+    }
+
+    /// Announce that this worker is alive, so its siblings can count it.
+    pub async fn announce(&self) -> Result<(), WorkerError> {
+        let ttl = Duration::from_secs(self.cfg.lease.ttl_secs);
+        self.leases
+            .heartbeat(&self.identity, ttl)
+            .await
+            .map_err(|e| WorkerError::Lease(e.to_string()))
+    }
+
+    /// Give back any shards beyond this worker's fair share.
+    ///
+    /// Without this the first worker to start would hold everything and keep
+    /// it: a second worker would sit idle until the first one died.
+    pub async fn release_excess(&mut self) -> Result<usize, WorkerError> {
+        let target = self.target_shards().await? as usize;
+        if self.held.len() <= target {
+            return Ok(0);
+        }
+        // Release from the top, so workers tend to settle on contiguous runs
+        // and the churn stays small.
+        let mut excess: Vec<u32> = self.held.iter().copied().collect();
+        excess.sort_unstable();
+        let to_release: Vec<u32> = excess.split_off(target);
+
+        for shard in &to_release {
+            if let Err(e) = self.leases.release(*shard, &self.identity).await {
+                warn!(shard, error = %e, "could not release a shard");
+            }
+            self.held.remove(shard);
+        }
+        if !to_release.is_empty() {
+            info!(count = to_release.len(), target, "gave back shards to share the work");
+        }
+        Ok(to_release.len())
+    }
+
+    /// Claim any shard nobody holds, up to this worker's fair share.
     pub async fn claim_shards(&mut self) -> Result<usize, WorkerError> {
         let ttl = Duration::from_secs(self.cfg.lease.ttl_secs);
-        let limit = if self.cfg.lease.max_shards_per_worker == 0 {
-            self.cfg.ingest.shards
-        } else {
-            self.cfg.lease.max_shards_per_worker
-        };
+        let limit = self.target_shards().await?;
 
         let mut claimed = 0;
         for shard in 0..self.cfg.ingest.shards {
@@ -266,12 +314,21 @@ impl<Q: Queue + ?Sized, S: Store + ?Sized, L: Leases + ?Sized> Worker<Q, S, L> {
                     }
                 }
                 _ = renew.tick() => {
+                    if let Err(e) = self.announce().await {
+                        error!(error = %e, "could not announce this worker");
+                    }
                     if let Err(e) = self.renew_leases().await {
                         error!(error = %e, "could not renew leases");
+                    }
+                    // Give back anything beyond a fair share before claiming,
+                    // so a newly started sibling has something to pick up.
+                    if let Err(e) = self.release_excess().await {
+                        error!(error = %e, "could not release excess shards");
                     }
                     if let Err(e) = self.claim_shards().await {
                         error!(error = %e, "could not claim shards");
                     }
+                    metrics::metrics().leases_held.set(self.held.len() as i64);
                 }
                 _ = work.tick() => {
                     let outcome = self.process_held().await;
@@ -445,6 +502,57 @@ mod tests {
         assert_eq!(worker.claim_shards().await.unwrap(), 4);
         assert_eq!(worker.held_shards(), vec![0, 1, 2, 3]);
         assert_eq!(worker.claim_shards().await.unwrap(), 0, "and does not double-claim");
+    }
+
+    #[tokio::test]
+    async fn a_second_worker_takes_half_the_shards_without_the_first_dying() {
+        // The first worker starts alone and takes everything. When a second
+        // appears, the first must give half back rather than holding on until
+        // it dies.
+        let cfg = cfg();
+        let queue = Arc::new(MemoryQueue::new(cfg.ingest.shards, 1_000));
+        let store = Arc::new(MemoryStore::new());
+        let leases = Arc::new(MemoryLeases::new());
+
+        let mut first =
+            Worker::new(queue.clone(), store.clone(), leases.clone(), cfg.clone(), "a".into());
+        first.announce().await.unwrap();
+        first.claim_shards().await.unwrap();
+        assert_eq!(first.held_shards().len(), 4, "alone, it takes them all");
+
+        let mut second = Worker::new(queue, store, leases, cfg, "b".into());
+        second.announce().await.unwrap();
+
+        first.release_excess().await.unwrap();
+        second.claim_shards().await.unwrap();
+
+        assert_eq!(first.held_shards().len(), 2);
+        assert_eq!(second.held_shards().len(), 2);
+        assert!(first.held_shards().iter().all(|s| !second.held_shards().contains(s)));
+    }
+
+    #[tokio::test]
+    async fn a_worker_reclaims_everything_when_its_sibling_disappears() {
+        let cfg = cfg();
+        let leases = Arc::new(MemoryLeases::new());
+        let mut first = Worker::new(
+            Arc::new(MemoryQueue::new(cfg.ingest.shards, 1_000)),
+            Arc::new(MemoryStore::new()),
+            leases.clone(),
+            cfg.clone(),
+            "a".into(),
+        );
+        first.announce().await.unwrap();
+        leases.heartbeat("b", Duration::from_secs(15)).await.unwrap();
+        first.claim_shards().await.unwrap();
+        assert_eq!(first.held_shards().len(), 2, "it shares while the sibling lives");
+
+        leases.forget_worker("b");
+        for shard in 0..cfg.ingest.shards {
+            leases.expire(shard);
+        }
+        first.claim_shards().await.unwrap();
+        assert_eq!(first.held_shards().len(), 4, "and takes over when it does not");
     }
 
     #[tokio::test]
