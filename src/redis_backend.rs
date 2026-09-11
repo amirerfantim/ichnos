@@ -418,7 +418,44 @@ impl Leases for RedisLeases {
             .await
             .map_err(|e| LeaseError::Unavailable(e.to_string()))
     }
+
+    async fn heartbeat(&self, owner: &str, _ttl: Duration) -> Result<(), LeaseError> {
+        let mut conn = self.conn.clone();
+        // A sorted set scored by time, so counting live workers is a range
+        // query rather than a scan, and a worker that stops announcing itself
+        // falls out on its own.
+        let now = chrono::Utc::now().timestamp();
+        redis::cmd("ZADD")
+            .arg(WORKERS_KEY)
+            .arg(now)
+            .arg(owner)
+            .query_async::<i64>(&mut conn)
+            .await
+            .map_err(|e| LeaseError::Unavailable(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn live_workers(&self, ttl: Duration) -> Result<usize, LeaseError> {
+        let mut conn = self.conn.clone();
+        let cutoff = chrono::Utc::now().timestamp() - ttl.as_secs().max(1) as i64;
+        // Drop the ones that have gone quiet, then count what is left.
+        let (_, count): (i64, i64) = redis::pipe()
+            .atomic()
+            .cmd("ZREMRANGEBYSCORE")
+            .arg(WORKERS_KEY)
+            .arg("-inf")
+            .arg(cutoff)
+            .cmd("ZCARD")
+            .arg(WORKERS_KEY)
+            .query_async(&mut conn)
+            .await
+            .map_err(|e| LeaseError::Unavailable(e.to_string()))?;
+        Ok(count.max(0) as usize)
+    }
 }
+
+/// Where workers announce themselves, so each can work out its fair share.
+const WORKERS_KEY: &str = "workers";
 
 #[cfg(test)]
 mod tests {
