@@ -252,6 +252,14 @@ pub struct Ingest {
     pub stream_maxlen: usize,
     /// Entries read from one stream in a single call.
     pub read_batch: usize,
+    /// Batches a worker will drain from one shard before moving on.
+    ///
+    /// A worker keeps pulling while a shard still has work, rather than taking
+    /// one batch and waiting for the next window. Without that, throughput is
+    /// capped at read_batch per shard per window regardless of how much is
+    /// waiting, and the queue grows without limit. The cap stops one busy
+    /// shard starving the others.
+    pub max_drain_batches: usize,
     /// Collapse repeats from one position bucket into a single weighted sample.
     /// Off by default, so counting matches Ichnaea exactly.
     pub collapse_by_position: bool,
@@ -266,6 +274,7 @@ impl Default for Ingest {
             fold_window_secs: 45,
             stream_maxlen: 200_000,
             read_batch: 5_000,
+            max_drain_batches: 50,
             collapse_by_position: false,
             collapse_bucket_m: 10.0,
         }
@@ -489,6 +498,14 @@ impl Config {
         }
         if self.ingest.stream_maxlen == 0 {
             return bad("ingest.stream_maxlen must be at least 1".into());
+        }
+        if self.ingest.read_batch == 0 {
+            return bad("ingest.read_batch must be at least 1".into());
+        }
+        if self.ingest.max_drain_batches == 0 {
+            return bad(
+                "ingest.max_drain_batches of 0 would stop the worker draining anything".into()
+            );
         }
         if self.lease.renew_secs == 0 || self.lease.renew_secs >= self.lease.ttl_secs {
             return bad(format!(
