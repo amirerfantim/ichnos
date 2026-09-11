@@ -4,10 +4,11 @@ use crate::api::auth::{AuthError, KeyCache, Permission};
 use crate::api::quota::{consume, QuotaCounter, QuotaVerdict};
 use crate::api::schema::*;
 use crate::config::Config;
+use crate::geo::distance;
 use crate::ingest::queue::Queue;
 use crate::ingest::validate::validate_item;
 use crate::locate::{self, Network, PositionSource};
-use crate::metrics::metrics;
+use crate::metrics::{metrics, Timer};
 use crate::model::key::{CellKey, Radio, StationKind, WifiKey};
 use crate::model::{Observation, Station, StationKey};
 use crate::store::Store;
@@ -74,13 +75,20 @@ async fn observations(
 ) -> Response {
     let started = Instant::now();
     let m = metrics();
+    let _busy = InFlight::enter("observations");
 
     let api_key =
         match state.keys.check(&*state.store, query.key.as_deref(), Permission::Submit).await {
-            Ok(key) => key,
-            Err(e) => return finish("observations", started, auth_response(e)),
+            Ok(key) => {
+                m.auth_results.with_label_values(&["observations", "ok"]).inc();
+                key
+            }
+            Err(e) => {
+                m.auth_results.with_label_values(&["observations", e.as_str()]).inc();
+                return finish("observations", started, auth_response(e));
+            }
         };
-    if over_quota(&state, api_key.as_ref()).await {
+    if over_quota(&state, api_key.as_ref(), "observations").await {
         return finish("observations", started, quota_response());
     }
 
@@ -95,20 +103,32 @@ async fn observations(
         );
     };
 
+    m.submit_items.observe(request.items.len() as f64);
+    let detail = state.cfg.metrics.observation_detail;
+
     let mut routed: Vec<(u32, Observation)> = Vec::new();
     for item in request.items.iter().take(state.cfg.api.max_items) {
+        m.submit_stations.observe((item.wifi_access_points.len() + item.cell_towers.len()) as f64);
+
         let validated = validate_item(item, &state.cfg.validation);
         for reason in &validated.dropped {
-            m.reports_dropped.with_label_values(&[&format!("{reason:?}")]).inc();
+            m.reports_dropped.with_label_values(&[reason.as_str()]).inc();
         }
         for observation in validated.observations {
+            if detail {
+                record_observation_shape(&observation, &state.cfg);
+            }
             let shard = observation.key.shard(state.cfg.ingest.shards);
             routed.push((shard, observation));
         }
     }
 
     if !routed.is_empty() {
-        match state.queue.publish(&routed).await {
+        let timer = Timer::start();
+        let result = state.queue.publish(&routed).await;
+        timer.observe_on(&m.queue_publish_seconds);
+
+        match result {
             Ok(accepted) => {
                 for (_, observation) in &routed {
                     let kind = kind_label(observation.key.kind());
@@ -124,12 +144,34 @@ async fn observations(
                 // The queue being down must not fail the client, who cannot do
                 // anything useful about it. The loss is counted instead.
                 tracing::warn!(error = %e, "could not queue observations");
+                m.queue_errors.with_label_values(&["publish"]).inc();
                 m.observations.with_label_values(&["any", "dropped"]).inc_by(routed.len() as u64);
             }
         }
     }
 
     finish("observations", started, (StatusCode::OK, Json(serde_json::json!({}))).into_response())
+}
+
+/// Record what one kept observation looked like.
+///
+/// Separate from the loop above so the cost is one call that config can skip,
+/// rather than four histogram writes threaded through the hot path.
+fn record_observation_shape(observation: &Observation, cfg: &Config) {
+    let m = metrics();
+    m.observation_weight.observe(observation.base_weight(&cfg.validation));
+    if let Some(accuracy) = observation.accuracy {
+        m.observation_accuracy.observe(accuracy);
+    }
+    if let Some(speed) = observation.speed {
+        m.observation_speed.observe(speed);
+    }
+    if let Some(age) = observation.age_ms {
+        // Age is a magnitude: a scan taken after the fix is just as stale as
+        // one taken the same distance before it.
+        m.observation_age.observe(age.abs());
+    }
+    m.observation_source.with_label_values(&[source_label(observation.source)]).inc();
 }
 
 // --------------------------------------------------------------- locate ----
@@ -142,13 +184,20 @@ async fn locate(
 ) -> Response {
     let started = Instant::now();
     let m = metrics();
+    let _busy = InFlight::enter("locate");
 
     let api_key =
         match state.keys.check(&*state.store, query.key.as_deref(), Permission::Locate).await {
-            Ok(key) => key,
-            Err(e) => return finish("locate", started, auth_response(e)),
+            Ok(key) => {
+                m.auth_results.with_label_values(&["locate", "ok"]).inc();
+                key
+            }
+            Err(e) => {
+                m.auth_results.with_label_values(&["locate", e.as_str()]).inc();
+                return finish("locate", started, auth_response(e));
+            }
         };
-    if over_quota(&state, api_key.as_ref()).await {
+    if over_quota(&state, api_key.as_ref(), "locate").await {
         return finish("locate", started, quota_response());
     }
 
@@ -162,11 +211,13 @@ async fn locate(
     };
 
     let lookup = RequestNetworks::from_request(&request, &state.cfg);
+    let sent = lookup.wifi.len() + lookup.cells.len();
     m.locate_networks.with_label_values(&["wifi", "sent"]).inc_by(lookup.wifi.len() as u64);
     m.locate_networks.with_label_values(&["cell", "sent"]).inc_by(lookup.cells.len() as u64);
 
     if lookup.is_empty() {
         m.locate_results.with_label_values(&["none"]).inc();
+        m.locate_no_answer.with_label_values(&["nothing_submitted"]).inc();
         return finish("locate", started, not_found());
     }
 
@@ -177,6 +228,7 @@ async fn locate(
             tracing::warn!(error = %e, "station lookup failed");
             m.degraded.set(1);
             m.locate_results.with_label_values(&["error"]).inc();
+            m.locate_no_answer.with_label_values(&["store_unavailable"]).inc();
             return finish("locate", started, degraded_not_found());
         }
     };
@@ -186,21 +238,38 @@ async fn locate(
     let today = now.date_naive();
     let (wifi_networks, cell_networks) = lookup.to_networks(&stations, &state.cfg, now, today);
 
+    let known = wifi_networks.len() + cell_networks.len();
     m.locate_networks.with_label_values(&["wifi", "known"]).inc_by(wifi_networks.len() as u64);
     m.locate_networks.with_label_values(&["cell", "known"]).inc_by(cell_networks.len() as u64);
+    // Coverage is the slow-moving number that says whether the database is
+    // still learning. It falls long before any error appears.
+    if sent > 0 {
+        m.locate_coverage.observe(known as f64 / sent as f64);
+    }
 
     let candidates = locate::candidates(wifi_networks.clone(), cell_networks.clone(), &state.cfg);
+    m.locate_candidates.observe(candidates.len() as f64);
+
     let Some(answer) = locate::best(&candidates) else {
         m.locate_results.with_label_values(&["none"]).inc();
+        // Knowing none of the stations is a coverage problem; knowing some but
+        // finding no cluster among them is an algorithm or a spoofing problem.
+        // They need different responses, so they are counted apart.
+        let reason = if known == 0 { "none_known" } else { "no_cluster" };
+        m.locate_no_answer.with_label_values(&[reason]).inc();
         return finish("locate", started, not_found());
     };
 
-    m.locate_results
-        .with_label_values(&[match answer.source {
-            PositionSource::Wifi => "wifi",
-            PositionSource::Cell => "cell",
-        }])
-        .inc();
+    let source = match answer.source {
+        PositionSource::Wifi => "wifi",
+        PositionSource::Cell => "cell",
+    };
+    m.locate_results.with_label_values(&[source]).inc();
+    m.locate_accuracy.with_label_values(&[source]).observe(answer.accuracy);
+    m.locate_cluster_size.with_label_values(&[source]).observe(answer.used.len() as f64);
+    m.locate_score.with_label_values(&[source]).observe(answer.score);
+    m.locate_stale_networks.inc_by(answer.used.iter().filter(|u| !u.seen_today).count() as u64);
+    record_disagreement(&candidates, &answer);
 
     let explain = query
         .wants_explain()
@@ -471,14 +540,64 @@ fn degraded_not_found() -> Response {
 }
 
 /// Has this key had its allowance for today?
-async fn over_quota(state: &AppState, api_key: Option<&crate::store::ApiKey>) -> bool {
+async fn over_quota(state: &AppState, api_key: Option<&crate::store::ApiKey>, route: &str) -> bool {
     match api_key {
         Some(key) => {
-            consume(&*state.quota, &key.key, key.daily_quota).await == QuotaVerdict::Exceeded
+            let exceeded =
+                consume(&*state.quota, &key.key, key.daily_quota).await == QuotaVerdict::Exceeded;
+            let result = if exceeded { "exceeded" } else { "allowed" };
+            metrics().quota_results.with_label_values(&[route, result]).inc();
+            exceeded
         }
         // No key means keys are not being required at all, which is a
         // development setting; there is nothing to count against.
         None => false,
+    }
+}
+
+/// Holds the in-flight gauge up for as long as a request is being handled.
+///
+/// A guard rather than a pair of calls, because an early return on any of the
+/// several refusal paths would otherwise leak the gauge upwards for ever.
+struct InFlight(&'static str);
+
+impl InFlight {
+    fn enter(route: &'static str) -> Self {
+        metrics().http_in_flight.with_label_values(&[route]).inc();
+        Self(route)
+    }
+}
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        metrics().http_in_flight.with_label_values(&[self.0]).dec();
+    }
+}
+
+/// How far the runner-up candidate sat from the winner.
+///
+/// One device should not see two sets of stations that disagree by kilometres.
+/// When it does, either the stations are wrong or the report is not honest, and
+/// this is the only metric that would show it.
+fn record_disagreement(candidates: &[locate::Position], answer: &locate::Position) {
+    let runner_up = candidates
+        .iter()
+        .filter(|c| *c != answer)
+        .max_by(|a, b| a.score.partial_cmp(&b.score).unwrap_or(std::cmp::Ordering::Equal));
+    if let Some(other) = runner_up {
+        metrics()
+            .locate_disagreement
+            .observe(distance(answer.lat, answer.lon, other.lat, other.lon));
+    }
+}
+
+fn source_label(source: crate::model::observation::ReportSource) -> &'static str {
+    use crate::model::observation::ReportSource::*;
+    match source {
+        Fixed => "fixed",
+        Gnss => "gnss",
+        Fused => "fused",
+        Query => "query",
     }
 }
 

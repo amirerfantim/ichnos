@@ -12,6 +12,7 @@
 
 use super::{ApiKey, Result, Station, Store};
 use crate::config::Cache as CacheCfg;
+use crate::metrics::{metrics, Timer};
 use crate::model::{StationKey, StationKind};
 use async_trait::async_trait;
 use std::collections::HashMap;
@@ -91,8 +92,11 @@ impl<S: Store, C: CacheBackend> Store for CachedStore<S, C> {
             return self.inner.get_stations(keys).await;
         }
 
+        let m = metrics();
         let cache_keys: Vec<String> = keys.iter().map(Self::cache_key).collect();
+        let timer = Timer::start();
         let cached = self.backend.get_many(&cache_keys).await;
+        timer.observe(&m.cache_operation_seconds, "get");
 
         let mut found: Vec<Station> = Vec::with_capacity(keys.len());
         let mut to_fetch: Vec<StationKey> = Vec::new();
@@ -102,21 +106,25 @@ impl<S: Store, C: CacheBackend> Store for CachedStore<S, C> {
                 Some(NEGATIVE) => {
                     // Known absent. No read, no result.
                     self.stats.negatives.fetch_add(1, Ordering::Relaxed);
+                    m.cache_events.with_label_values(&["negative"]).inc();
                 }
                 Some(raw) => match serde_json::from_str::<Station>(raw) {
                     Ok(station) => {
                         self.stats.hits.fetch_add(1, Ordering::Relaxed);
+                        m.cache_events.with_label_values(&["hit"]).inc();
                         found.push(station);
                     }
                     Err(_) => {
                         // A corrupt entry is treated as a miss rather than an
                         // error: the real store is still the truth.
                         self.stats.errors.fetch_add(1, Ordering::Relaxed);
+                        m.cache_events.with_label_values(&["corrupt"]).inc();
                         to_fetch.push(*key);
                     }
                 },
                 None => {
                     self.stats.misses.fetch_add(1, Ordering::Relaxed);
+                    m.cache_events.with_label_values(&["miss"]).inc();
                     to_fetch.push(*key);
                 }
             }
@@ -146,7 +154,9 @@ impl<S: Store, C: CacheBackend> Store for CachedStore<S, C> {
                 )),
             }
         }
+        let timer = Timer::start();
         self.backend.set_many(&writes).await;
+        timer.observe(&m.cache_operation_seconds, "set");
 
         found.extend(fetched);
         Ok(found)

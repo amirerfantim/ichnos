@@ -57,6 +57,67 @@ pub trait Queue: Send + Sync + 'static {
     async fn healthy(&self) -> bool;
 }
 
+/// Sample queue depth into the metrics, for ever, until told to stop.
+///
+/// Depth cannot be recorded where entries are written, because nobody writes
+/// to a shard often enough to notice it filling, and a shard nobody writes to
+/// is exactly the one a dead worker leaves behind. So it is sampled instead.
+///
+/// The fill ratio is taken from the fullest shard rather than the average: one
+/// stuck shard is losing data even while the other thirty-one look idle.
+pub async fn poll_depth<Q: Queue + ?Sized>(
+    queue: std::sync::Arc<Q>,
+    shards: u32,
+    maxlen: usize,
+    every: std::time::Duration,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) {
+    let m = crate::metrics::metrics();
+    let mut ticker = tokio::time::interval(every);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // The queue counts trims cumulatively; the metric is a counter, so only
+    // the step since the last sample may be added.
+    let mut reported_trims = 0u64;
+
+    loop {
+        tokio::select! {
+            _ = shutdown.changed() => {
+                if *shutdown.borrow() {
+                    return;
+                }
+            }
+            _ = ticker.tick() => {
+                let mut total = 0usize;
+                let mut fullest = 0usize;
+                for shard in 0..shards {
+                    match queue.depth(shard).await {
+                        Ok(depth) => {
+                            m.stream_depth
+                                .with_label_values(&[&shard.to_string()])
+                                .set(depth as i64);
+                            total += depth;
+                            fullest = fullest.max(depth);
+                        }
+                        Err(_) => {
+                            m.queue_errors.with_label_values(&["depth"]).inc();
+                        }
+                    }
+                }
+                m.stream_depth_total.set(total as i64);
+                if maxlen > 0 {
+                    m.stream_fill_ratio.set(fullest as f64 / maxlen as f64);
+                }
+
+                let trims = queue.trimmed();
+                if trims > reported_trims {
+                    m.stream_trimmed.inc_by(trims - reported_trims);
+                    reported_trims = trims;
+                }
+            }
+        }
+    }
+}
+
 /// An in-process queue for tests and single-process runs.
 #[derive(Clone)]
 pub struct MemoryQueue {
