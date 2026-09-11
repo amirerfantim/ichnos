@@ -73,6 +73,11 @@ enum Command {
     /// Load stations from a newline-delimited JSON file.
     Import { input: PathBuf },
     /// Write every station to a newline-delimited JSON file.
+    ///
+    /// In-memory runs only. Exporting every row means scanning, which the
+    /// production store does not offer: it is a key-value store on purpose.
+    /// Take production snapshots with the database's own tooling, which does
+    /// not drag the whole table through this service.
     Export { output: PathBuf },
     /// Manage API keys.
     Keys {
