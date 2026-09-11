@@ -5,16 +5,22 @@ it can see, and learns where those stations are from devices that already know
 their own position.
 
 It is a ground-up reimplementation of [Mozilla Ichnaea][ichnaea]'s positioning
-algorithm in Rust, wire-compatible with its API. The maths is deliberately
-unchanged, so answers can be compared against the original directly. What
-differs is everything around the maths, which is built for a very different
-traffic shape: many devices reporting the same stations, over and over, all day.
+algorithm in Rust. The maths is deliberately unchanged, so answers can be
+compared against the original directly. What differs is everything around the
+maths, which is built for a very different traffic shape: many devices reporting
+the same stations, over and over, all day.
+
+The request and response bodies are Ichnaea's, so a client only has to change
+which URL it posts to. The routes themselves are not: upstream's `/v2/geosubmit`
+and `/v1/geolocate` carry a version mismatch inherited from its own history, and
+"geosubmit" is not a name anyone would invent. Ichnos posts observations to a
+collection and asks a question of an endpoint that computes.
 
 [ichnaea]: https://github.com/mozilla/ichnaea
 
 ```
-POST /v2/geosubmit   "I am here, and these are the stations I can see"
-POST /v1/geolocate   "These are the stations I can see. Where am I?"
+POST /v1/observations   "I am here, and these are the stations I can see"
+POST /v1/locate         "These are the stations I can see. Where am I?"
 ```
 
 ---
@@ -55,7 +61,7 @@ cargo run -- serve --in-memory --with-worker
 Then teach it two access points and ask where they are:
 
 ```bash
-curl -X POST 'localhost:8080/v2/geosubmit?key=dev-key' \
+curl -X POST 'localhost:8080/v1/observations?key=dev-key' \
   -H 'Content-Type: application/json' -d '{
     "items": [{
       "position": {"latitude": 52.3676, "longitude": 4.9041, "accuracy": 10},
@@ -64,7 +70,7 @@ curl -X POST 'localhost:8080/v2/geosubmit?key=dev-key' \
         {"macAddress": "aabbccddee02", "signalStrength": -70, "frequency": 2437}]}]}'
 
 # wait for the fold window, then:
-curl -X POST 'localhost:8080/v1/geolocate?key=dev-key' \
+curl -X POST 'localhost:8080/v1/locate?key=dev-key' \
   -H 'Content-Type: application/json' -d '{
     "wifiAccessPoints": [
       {"macAddress": "aabbccddee01", "signalStrength": -65},
@@ -87,14 +93,14 @@ cargo run -- worker                       # the writer, in another terminal
 
 ## The API
 
-### `POST /v2/geosubmit`
+### `POST /v1/observations`
 
 A device reporting where it is and what it can see. Always answers `200`, even
 when every report in the batch was rejected: clients fire this and forget it, so
 failing them over data quality would lose the reports that were fine and gain
 nothing. What was rejected, and why, appears in the metrics.
 
-### `POST /v1/geolocate`
+### `POST /v1/locate`
 
 A device asking where it is. Answers `200` with `{"location": {"lat", "lng"},
 "accuracy"}`, or `404` with the same error body Ichnaea returns.

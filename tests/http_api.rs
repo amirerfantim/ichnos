@@ -67,7 +67,7 @@ impl Harness {
 
     async fn submit(&self, body: Value) -> u16 {
         self.server
-            .post("/v2/geosubmit")
+            .post("/v1/observations")
             .add_query_param("key", "test-key")
             .json(&body)
             .await
@@ -77,7 +77,7 @@ impl Harness {
 
     async fn locate(&self, body: Value) -> (u16, Value) {
         let response =
-            self.server.post("/v1/geolocate").add_query_param("key", "test-key").json(&body).await;
+            self.server.post("/v1/locate").add_query_param("key", "test-key").json(&body).await;
         let status = response.status_code().as_u16();
         (status, response.json::<Value>())
     }
@@ -216,7 +216,7 @@ async fn a_malformed_body_is_refused_plainly() {
     let h = Harness::new().await;
     let response = h
         .server
-        .post("/v2/geosubmit")
+        .post("/v1/observations")
         .add_query_param("key", "test-key")
         .text("this is not json")
         .await;
@@ -229,21 +229,21 @@ async fn permissions_are_enforced_per_endpoint() {
 
     let refused = h
         .server
-        .post("/v2/geosubmit")
+        .post("/v1/observations")
         .add_query_param("key", "read-only")
         .json(&report(35.7219, 51.3347, &[("aabbccddee01", -65)]))
         .await;
     assert_eq!(refused.status_code().as_u16(), 400, "a read-only key may not submit");
 
     let allowed =
-        h.server.post("/v1/geolocate").add_query_param("key", "read-only").json(&json!({})).await;
+        h.server.post("/v1/locate").add_query_param("key", "read-only").json(&json!({})).await;
     assert_eq!(allowed.status_code().as_u16(), 404, "but it may ask");
 }
 
 #[tokio::test]
 async fn a_request_without_a_key_is_refused() {
     let h = Harness::new().await;
-    let response = h.server.post("/v1/geolocate").json(&json!({})).await;
+    let response = h.server.post("/v1/locate").json(&json!({})).await;
     assert_eq!(response.status_code().as_u16(), 400);
 }
 
@@ -256,7 +256,7 @@ async fn the_explain_output_shows_the_working() {
 
     let response = h
         .server
-        .post("/v1/geolocate")
+        .post("/v1/locate")
         .add_query_param("key", "test-key")
         .add_query_param("explain", "1")
         .json(&ask(&macs))
@@ -374,7 +374,7 @@ async fn a_locate_during_a_storage_outage_says_so_in_a_header() {
 
     let response = h
         .server
-        .post("/v1/geolocate")
+        .post("/v1/locate")
         .add_query_param("key", "test-key")
         .json(&ask(&[("aabbccddee01", -65), ("aabbccddee02", -70)]))
         .await;
@@ -392,7 +392,7 @@ async fn an_outage_is_never_reported_as_a_bad_api_key() {
 
     let response = h
         .server
-        .post("/v1/geolocate")
+        .post("/v1/locate")
         .add_query_param("key", "never-seen-before")
         .json(&json!({}))
         .await;
@@ -460,16 +460,13 @@ async fn a_key_is_refused_once_it_has_had_its_daily_allowance() {
     let server = TestServer::new(router(state)).unwrap();
 
     for i in 1..=3 {
-        let response = server
-            .post("/v1/geolocate")
-            .add_query_param("key", "small-quota")
-            .json(&json!({}))
-            .await;
+        let response =
+            server.post("/v1/locate").add_query_param("key", "small-quota").json(&json!({})).await;
         assert_eq!(response.status_code().as_u16(), 404, "request {i} should be served");
     }
 
     let refused =
-        server.post("/v1/geolocate").add_query_param("key", "small-quota").json(&json!({})).await;
+        server.post("/v1/locate").add_query_param("key", "small-quota").json(&json!({})).await;
     assert_eq!(refused.status_code().as_u16(), 429);
 }
 
