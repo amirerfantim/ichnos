@@ -182,12 +182,36 @@ async fn build_queue(cfg: &Config, in_memory: bool, consumer: String) -> Result<
     Ok(Arc::new(queue))
 }
 
+/// Start sampling queue depth in the background, unless config says not to.
+///
+/// Every process that can reach the queue does this, including one running only
+/// the HTTP surface: depth is a property of the queue, not of the worker, and a
+/// deployment whose workers have all died is precisely when someone needs to
+/// still be watching it.
+fn spawn_depth_poller(
+    cfg: &Config,
+    queue: Arc<dyn ichnos::ingest::queue::Queue>,
+    shutdown: watch::Receiver<bool>,
+) {
+    if !cfg.metrics.poll_enabled {
+        return;
+    }
+    let shards = cfg.ingest.shards;
+    let maxlen = cfg.ingest.stream_maxlen;
+    let every = std::time::Duration::from_secs(cfg.metrics.poll_secs);
+    tokio::spawn(async move {
+        ichnos::ingest::queue::poll_depth(queue, shards, maxlen, every, shutdown).await;
+    });
+}
+
 async fn serve(cfg: Config, in_memory: bool, with_worker: bool) -> Result<()> {
     let store = build_store(&cfg, in_memory).await?;
     let queue = build_queue(&cfg, in_memory, format!("api-{}", identity())).await?;
     let keys = Arc::new(KeyCache::new(&cfg.api));
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+    spawn_depth_poller(&cfg, queue.clone(), shutdown_rx.clone());
 
     if with_worker {
         // The in-memory store and queue live in this process, so a separate
@@ -267,6 +291,8 @@ async fn run_worker(cfg: Config, in_memory: bool, identity_arg: Option<String>) 
         shutdown_signal().await;
         let _ = tx.send(true);
     });
+
+    spawn_depth_poller(&cfg, queue.clone(), rx.clone());
 
     let mut worker = Worker::new(queue, store, leases, cfg, identity);
     // Announce before claiming, or this worker counts itself as the only one

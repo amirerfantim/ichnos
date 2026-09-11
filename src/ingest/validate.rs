@@ -35,6 +35,30 @@ pub enum DropReason {
     CellFieldOutOfRange,
 }
 
+impl DropReason {
+    /// A stable metric label.
+    ///
+    /// Formatting the enum instead would allocate a string for every dropped
+    /// station, on the busiest path in the service.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DropReason::NoPosition => "no_position",
+            DropReason::PositionOutOfRange => "position_out_of_range",
+            DropReason::AccuracyOutOfRange => "accuracy_out_of_range",
+            DropReason::SpeedOutOfRange => "speed_out_of_range",
+            DropReason::AgeOutOfRange => "age_out_of_range",
+            DropReason::Worthless => "worthless",
+            DropReason::BadMac => "bad_mac",
+            DropReason::PlaceholderMac => "placeholder_mac",
+            DropReason::FrequencyOutOfRange => "frequency_out_of_range",
+            DropReason::SignalOutOfRange => "signal_out_of_range",
+            DropReason::UnknownRadio => "unknown_radio",
+            DropReason::MccNotAllowed => "mcc_not_allowed",
+            DropReason::CellFieldOutOfRange => "cell_field_out_of_range",
+        }
+    }
+}
+
 /// What came out of one report.
 #[derive(Debug, Default, Clone)]
 pub struct Validated {
@@ -318,6 +342,33 @@ mod tests {
             timestamp: Some(1_700_000_000_000),
             cell_towers: vec![good_cell()],
             wifi_access_points: vec![good_wifi("aabbccddeeff")],
+        }
+    }
+
+    #[test]
+    fn every_drop_reason_has_its_own_label() {
+        // Two reasons sharing a label would merge two different problems into
+        // one line on a dashboard, which is worse than not counting either.
+        let all = [
+            DropReason::NoPosition,
+            DropReason::PositionOutOfRange,
+            DropReason::AccuracyOutOfRange,
+            DropReason::SpeedOutOfRange,
+            DropReason::AgeOutOfRange,
+            DropReason::Worthless,
+            DropReason::BadMac,
+            DropReason::PlaceholderMac,
+            DropReason::FrequencyOutOfRange,
+            DropReason::SignalOutOfRange,
+            DropReason::UnknownRadio,
+            DropReason::MccNotAllowed,
+            DropReason::CellFieldOutOfRange,
+        ];
+        let mut seen = std::collections::HashSet::new();
+        for reason in all {
+            let label = reason.as_str();
+            assert!(!label.is_empty(), "{reason:?} has no label");
+            assert!(seen.insert(label), "{label} is used by more than one reason");
         }
     }
 

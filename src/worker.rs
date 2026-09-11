@@ -10,11 +10,12 @@
 //! the whole reason the ownership dance is worth its complexity.
 
 use crate::config::Config;
+use crate::geo::distance;
 use crate::ingest::elide::{self, Write};
 use crate::ingest::fold::{self, Action};
 use crate::ingest::lease::{fair_share, Leases};
 use crate::ingest::queue::{Entry, Queue};
-use crate::metrics;
+use crate::metrics::{self, Timer};
 use crate::model::{Station, StationKey};
 use crate::store::Store;
 use chrono::Utc;
@@ -90,10 +91,14 @@ async fn drain_once<Q: Queue + ?Sized, S: Store + ?Sized>(
     shard: u32,
     cfg: &Config,
 ) -> Result<ShardOutcome, WorkerError> {
-    let entries: Vec<Entry> = queue
-        .read(shard, cfg.ingest.read_batch)
-        .await
-        .map_err(|e| WorkerError::Queue(e.to_string()))?;
+    let m = metrics::metrics();
+    let drain = Timer::start();
+
+    let entries: Vec<Entry> = queue.read(shard, cfg.ingest.read_batch).await.map_err(|e| {
+        m.worker_errors.with_label_values(&["queue_read"]).inc();
+        m.queue_errors.with_label_values(&["read"]).inc();
+        WorkerError::Queue(e.to_string())
+    })?;
 
     if entries.is_empty() {
         return Ok(ShardOutcome::default());
@@ -102,18 +107,25 @@ async fn drain_once<Q: Queue + ?Sized, S: Store + ?Sized>(
     let ids: Vec<String> = entries.iter().map(|e| e.id.clone()).collect();
     let observations: Vec<_> = entries.into_iter().map(|e| e.observation).collect();
     let observation_count = observations.len();
+    m.shard_batch_observations.observe(observation_count as f64);
+    record_queue_lag(&observations);
 
     let grouped = fold::group(observations);
     let keys: Vec<StationKey> = grouped.keys().copied().collect();
 
     // One read for the whole batch, not one per station.
+    let read = Timer::start();
     let existing: BTreeMap<StationKey, Station> = store
         .get_stations(&keys)
         .await
-        .map_err(|e| WorkerError::Store(e.to_string()))?
+        .map_err(|e| {
+            m.worker_errors.with_label_values(&["store_read"]).inc();
+            WorkerError::Store(e.to_string())
+        })?
         .into_iter()
         .map(|s| (s.key, s))
         .collect();
+    read.observe(&m.db_operation_seconds, "fold_read");
 
     let now = Utc::now();
     let today = now.date_naive();
@@ -128,29 +140,83 @@ async fn drain_once<Q: Queue + ?Sized, S: Store + ?Sized>(
         let previous = existing.get(&key);
         let update = fold::fold_station(key, &observations, previous, cfg, now);
 
+        let kind = match key.kind() {
+            crate::model::key::StationKind::Wifi => "wifi",
+            crate::model::key::StationKind::Cell => "cell",
+        };
+        m.station_writes.with_label_values(&[kind, update.action.as_str()]).inc();
+
         match update.action {
             Action::Block | Action::NewBlock => outcome.blocked += 1,
             Action::New => outcome.created += 1,
             _ => {}
         }
+        record_movement(previous, &update.station);
 
         match elide::decide(&update, previous, today, &cfg.elision) {
-            Write::Full => to_write.push(update.station),
-            Write::Skip => outcome.skipped += 1,
+            Write::Full => {
+                m.elision.with_label_values(&["write"]).inc();
+                to_write.push(update.station);
+            }
+            Write::Skip => {
+                m.elision.with_label_values(&["skip"]).inc();
+                outcome.skipped += 1;
+            }
         }
     }
 
     outcome.written = to_write.len();
     if !to_write.is_empty() {
-        store.put_stations(&to_write).await.map_err(|e| WorkerError::Store(e.to_string()))?;
+        let write = Timer::start();
+        let result = store.put_stations(&to_write).await;
+        write.observe_on(&m.db_batch_seconds);
+        result.map_err(|e| {
+            m.worker_errors.with_label_values(&["store_write"]).inc();
+            WorkerError::Store(e.to_string())
+        })?;
     }
 
     // Acknowledge only after the write succeeded. A crash before this point
     // leaves the batch to be redelivered, which at worst folds it twice, and
     // folding the same evidence twice is harmless.
-    queue.ack(shard, &ids).await.map_err(|e| WorkerError::Queue(e.to_string()))?;
+    queue.ack(shard, &ids).await.map_err(|e| {
+        m.worker_errors.with_label_values(&["queue_ack"]).inc();
+        m.queue_errors.with_label_values(&["ack"]).inc();
+        WorkerError::Queue(e.to_string())
+    })?;
+
+    let ratio = outcome.fold_ratio();
+    m.fold_ratio.set(ratio);
+    m.fold_ratio_hist.observe(ratio);
+    drain.observe_on(&m.shard_drain_seconds);
 
     Ok(outcome)
+}
+
+/// How long the oldest observation in this batch waited to be processed.
+///
+/// Depth says how much is waiting; this says how long it has been waiting,
+/// which is the number that tells you whether a backlog is actually hurting.
+fn record_queue_lag(observations: &[crate::model::Observation]) {
+    let Some(oldest) = observations.iter().map(|o| o.timestamp).min() else {
+        return;
+    };
+    let lag_ms = Utc::now().timestamp_millis() - oldest;
+    if lag_ms > 0 {
+        metrics::metrics().queue_lag_seconds.observe(lag_ms as f64 / 1000.0);
+    }
+}
+
+/// How far a station's recorded position moved in this update.
+///
+/// A settled station moves centimetres. A histogram that suddenly grows a tail
+/// at kilometres means either the area genuinely changed or something is
+/// feeding the service positions it should not trust.
+fn record_movement(previous: Option<&Station>, updated: &Station) {
+    let Some(previous) = previous else { return };
+    let (Some(old_lat), Some(old_lon)) = (previous.lat, previous.lon) else { return };
+    let (Some(new_lat), Some(new_lon)) = (updated.lat, updated.lon) else { return };
+    metrics::metrics().station_moved.observe(distance(old_lat, old_lon, new_lat, new_lon));
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -201,9 +267,18 @@ impl<Q: Queue + ?Sized, S: Store + ?Sized, L: Leases + ?Sized> Worker<Q, S, L> {
             return Ok(self.cfg.lease.max_shards_per_worker);
         }
         let ttl = Duration::from_secs(self.cfg.lease.ttl_secs);
-        let workers =
-            self.leases.live_workers(ttl).await.map_err(|e| WorkerError::Lease(e.to_string()))?;
-        Ok(fair_share(self.cfg.ingest.shards, workers))
+        let workers = self.leases.live_workers(ttl).await.map_err(|e| {
+            metrics::metrics().worker_errors.with_label_values(&["lease_count"]).inc();
+            WorkerError::Lease(e.to_string())
+        })?;
+        // Published here rather than in the run loop: this is the only place
+        // that knows how many siblings answered, and a worker that cannot see
+        // its siblings takes every shard, which is worth being able to see.
+        let m = metrics::metrics();
+        m.workers_live.set(workers as i64);
+        let share = fair_share(self.cfg.ingest.shards, workers);
+        m.leases_target.set(share as i64);
+        Ok(share)
     }
 
     /// Announce that this worker is alive, so its siblings can count it.
@@ -236,6 +311,10 @@ impl<Q: Queue + ?Sized, S: Store + ?Sized, L: Leases + ?Sized> Worker<Q, S, L> {
             }
             self.held.remove(shard);
         }
+        metrics::metrics()
+            .lease_events
+            .with_label_values(&["released"])
+            .inc_by(to_release.len() as u64);
         if !to_release.is_empty() {
             info!(count = to_release.len(), target, "gave back shards to share the work");
         }
@@ -261,9 +340,13 @@ impl<Q: Queue + ?Sized, S: Store + ?Sized, L: Leases + ?Sized> Worker<Q, S, L> {
                     claimed += 1;
                 }
                 Ok(false) => {}
-                Err(e) => return Err(WorkerError::Lease(e.to_string())),
+                Err(e) => {
+                    metrics::metrics().worker_errors.with_label_values(&["lease_acquire"]).inc();
+                    return Err(WorkerError::Lease(e.to_string()));
+                }
             }
         }
+        metrics::metrics().lease_events.with_label_values(&["claimed"]).inc_by(claimed as u64);
         Ok(claimed)
     }
 
@@ -274,13 +357,22 @@ impl<Q: Queue + ?Sized, S: Store + ?Sized, L: Leases + ?Sized> Worker<Q, S, L> {
     pub async fn renew_leases(&mut self) -> Result<(), WorkerError> {
         let ttl = Duration::from_secs(self.cfg.lease.ttl_secs);
         let mut lost = Vec::new();
+        let mut renewed = 0u64;
         for &shard in &self.held {
             match self.leases.renew(shard, &self.identity, ttl).await {
-                Ok(true) => {}
+                Ok(true) => renewed += 1,
                 Ok(false) => lost.push(shard),
-                Err(e) => return Err(WorkerError::Lease(e.to_string())),
+                Err(e) => {
+                    metrics::metrics().worker_errors.with_label_values(&["lease_renew"]).inc();
+                    return Err(WorkerError::Lease(e.to_string()));
+                }
             }
         }
+        let m = metrics::metrics();
+        m.lease_events.with_label_values(&["renewed"]).inc_by(renewed);
+        // A lost lease means a sibling already owns the shard. It is the only
+        // event here that says a takeover happened, so it is worth alerting on.
+        m.lease_events.with_label_values(&["lost"]).inc_by(lost.len() as u64);
         for shard in lost {
             warn!(shard, "lost the lease on a shard; releasing it");
             self.held.remove(&shard);
@@ -304,6 +396,7 @@ impl<Q: Queue + ?Sized, S: Store + ?Sized, L: Leases + ?Sized> Worker<Q, S, L> {
                 Err(e) => {
                     // One shard failing must not stop the others. The batch was
                     // not acknowledged, so it comes back.
+                    metrics::metrics().worker_errors.with_label_values(&["shard"]).inc();
                     error!(shard, error = %e, "shard failed; its batch will be redelivered");
                 }
             }
@@ -319,7 +412,10 @@ impl<Q: Queue + ?Sized, S: Store + ?Sized, L: Leases + ?Sized> Worker<Q, S, L> {
                 warn!(shard, error = %e, "could not release a shard cleanly");
             }
         }
+        let m = metrics::metrics();
+        m.lease_events.with_label_values(&["released"]).inc_by(self.held.len() as u64);
         self.held.clear();
+        m.leases_held.set(0);
     }
 
     /// Run until told to stop.
@@ -345,6 +441,7 @@ impl<Q: Queue + ?Sized, S: Store + ?Sized, L: Leases + ?Sized> Worker<Q, S, L> {
                 }
                 _ = renew.tick() => {
                     if let Err(e) = self.announce().await {
+                        metrics::metrics().worker_errors.with_label_values(&["announce"]).inc();
                         error!(error = %e, "could not announce this worker");
                     }
                     if let Err(e) = self.renew_leases().await {

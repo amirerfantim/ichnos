@@ -40,6 +40,17 @@ impl AuthError {
     }
 
     /// Whether this is the caller's fault or ours.
+    /// A stable metric label, so a dashboard can show why callers are being
+    /// turned away without anyone reading the logs.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AuthError::Missing => "missing",
+            AuthError::Unknown => "unknown",
+            AuthError::NotPermitted => "not_permitted",
+            AuthError::Unavailable => "unavailable",
+        }
+    }
+
     pub fn is_our_fault(self) -> bool {
         matches!(self, AuthError::Unavailable)
     }
@@ -159,6 +170,20 @@ mod tests {
         let store = MemoryStore::new();
         store.put_api_key(&key).await.unwrap();
         store
+    }
+
+    #[test]
+    fn every_auth_failure_has_its_own_label() {
+        let all = [
+            AuthError::Missing,
+            AuthError::Unknown,
+            AuthError::NotPermitted,
+            AuthError::Unavailable,
+        ];
+        let mut seen = std::collections::HashSet::new();
+        for error in all {
+            assert!(seen.insert(error.as_str()), "{} is used twice", error.as_str());
+        }
     }
 
     #[tokio::test]

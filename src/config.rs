@@ -25,6 +25,7 @@ pub struct Config {
     pub cql: Cql,
     pub redis: RedisCfg,
     pub api: Api,
+    pub metrics: MetricsCfg,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -331,6 +332,30 @@ impl Default for Spatial {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
+pub struct MetricsCfg {
+    /// Sample queue depth in the background. Turning this off leaves the depth
+    /// gauges empty, which costs the earliest warning the service has.
+    pub poll_enabled: bool,
+    /// How often to sample queue depth. Each sample costs one cheap call per
+    /// shard, so this is a trade between resolution and chatter.
+    pub poll_secs: u64,
+    /// Record the shape of each kept observation: its weight, claimed
+    /// accuracy, reporter speed and scan age.
+    ///
+    /// Four histogram writes per observation, on the hottest path there is.
+    /// Worth it while tuning the weights or hunting stationary reporters, and
+    /// worth turning off once the answers stop changing.
+    pub observation_detail: bool,
+}
+
+impl Default for MetricsCfg {
+    fn default() -> Self {
+        Self { poll_enabled: true, poll_secs: 15, observation_detail: true }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
 pub struct Cache {
     pub enabled: bool,
     /// How long a known station stays cached.
@@ -513,6 +538,9 @@ impl Config {
                  while its owner still believes it holds the shard",
                 self.lease.renew_secs, self.lease.ttl_secs
             ));
+        }
+        if self.metrics.poll_enabled && self.metrics.poll_secs == 0 {
+            return bad("metrics.poll_secs must be at least 1 when polling is on".into());
         }
         if self.cql.nodes.is_empty() {
             return bad("cql.nodes must list at least one node".into());
