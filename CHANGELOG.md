@@ -1,5 +1,61 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- **Five declared metrics were never written by any code path.** The metrics
+  module named `ichnos_stream_depth` and `ichnos_fold_ratio` as two of the
+  three an operator watches, and nothing set either of them. Also dead:
+  `ichnos_stream_trimmed_total`, which counts lost data,
+  `ichnos_station_writes_total`, `ichnos_db_batch_seconds` and
+  `ichnos_cache_total`. The whole worker and storage layer reported nothing.
+  Nothing failed; the dashboard was simply empty, and would have stayed empty
+  until someone needed it during an incident. `tests/metrics.rs` now drives the
+  assembled service and checks every declared family is actually written.
+- Dropping a station allocated a string for its metric label, on the hottest
+  path in the service. Labels are now static.
+
+### Added
+
+- Queue depth is sampled by a background poller, in every process that can
+  reach the queue rather than only in a worker: a deployment whose workers have
+  all died is exactly when someone needs depth to still be reported.
+- `ichnos_stream_fill_ratio`, depth against the cap, taken from the fullest
+  shard. Depth alone means nothing without the cap it is measured against, and
+  one stuck shard loses data while thirty-one others look idle.
+- `ichnos_queue_lag_seconds`: how long the oldest observation in a batch
+  waited. Depth says how much is waiting; lag says whether it is hurting.
+- Answer-quality metrics, none of which existed: `ichnos_locate_accuracy_meters`,
+  `ichnos_locate_coverage`, `ichnos_locate_no_answer_total{reason}`,
+  `ichnos_locate_cluster_size`, `ichnos_locate_score`,
+  `ichnos_locate_candidates`, `ichnos_locate_stale_networks_total`.
+- `ichnos_locate_disagreement_meters`: how far the runner-up candidate sat from
+  the winner. One device should not see two sets of stations that disagree by
+  kilometres; when it does, either the stations are wrong or the report is not
+  honest.
+- `ichnos_station_moved_meters`: how far a station's position moved in one
+  update. A settled station moves centimetres.
+- Incoming-data shape: `ichnos_observation_weight`,
+  `ichnos_observation_accuracy_meters`, `ichnos_observation_speed_mps`,
+  `ichnos_observation_age_ms`, `ichnos_observation_source_total`. The speed
+  histogram's lowest bucket is the stationary vehicle, which for a ride-hailing
+  fleet means the same spot counted over and over.
+- Per-operation latency and errors for storage, cache and queue:
+  `ichnos_db_operation_seconds{op}`, `ichnos_db_errors_total{op}`,
+  `ichnos_db_rows_total{op}`, `ichnos_cache_operation_seconds{op}`,
+  `ichnos_queue_publish_seconds`, `ichnos_queue_errors_total{op}`.
+- Worker ownership: `ichnos_workers_live`, `ichnos_leases_target`,
+  `ichnos_lease_events_total{event}` where `lost` is the takeover signal, and
+  `ichnos_worker_errors_total{stage}`.
+- Request-level detail: `ichnos_http_in_flight{route}`,
+  `ichnos_auth_total{route,result}`, `ichnos_quota_total{route,result}`,
+  `ichnos_submit_items`, `ichnos_submit_stations`.
+- `ichnos_build_info{version}` and `ichnos_start_time_seconds`.
+- A `[metrics]` config section: `poll_enabled`, `poll_secs`, and
+  `observation_detail` to switch off the four per-observation histograms once
+  the weights stop changing.
+
 ## 0.1.0
 
 First release. Locates devices from WiFi access points and cell towers, and

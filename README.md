@@ -253,17 +253,75 @@ ichnos show-config
 can be scaled apart, and so a busy worker cannot slow down an answer. For
 development, `serve --with-worker` runs both.
 
-### Metrics worth watching
+### Metrics
 
-- **`ichnos_stream_depth`** — the early warning. A worker falling behind shows
-  up as a growing queue long before it shows up as a bad answer.
-- **`ichnos_fold_ratio`** — observations per station. If it falls towards one,
-  folding has stopped saving anything.
-- **`ichnos_stream_trimmed_total`** — queue entries dropped at the cap. Some is
-  fine; a rising rate means the writers cannot keep up.
-- **`ichnos_degraded`** — the read path is answering from cache alone.
-- **`ichnos_cache_total{result}`** — a falling hit rate means more database
-  traffic, and it is the cheapest thing to fix.
+Everything is published at `GET /metrics` in Prometheus text format. The metrics
+divide into three kinds, and the difference is what makes a dashboard useful:
+**health** says wake someone, **behaviour** says why the health numbers moved,
+and **quality** says whether the answers are getting better or worse.
+
+#### Watch these four
+
+| Metric | Why |
+|---|---|
+| `ichnos_stream_fill_ratio` | The fullest shard against its cap. Rises before anything breaks. Depth alone means nothing without the cap it is measured against. |
+| `ichnos_stream_trimmed_total` | Data loss. Should be flat at zero. |
+| `ichnos_locate_coverage` | Share of asked-about networks the service knew. Falls long before any error appears. |
+| `ichnos_degraded` | The read path is answering from cache alone. |
+
+#### Health
+
+`ichnos_http_requests_total{route,status}`, `ichnos_http_duration_seconds{route}`,
+`ichnos_http_in_flight{route}`, `ichnos_auth_total{route,result}`,
+`ichnos_quota_total{route,result}`, `ichnos_worker_errors_total{stage}`,
+`ichnos_db_errors_total{op}`, `ichnos_queue_errors_total{op}`,
+`ichnos_stream_depth{shard}`, `ichnos_stream_depth_total`,
+`ichnos_queue_lag_seconds`, `ichnos_build_info{version}`,
+`ichnos_start_time_seconds`.
+
+`ichnos_queue_lag_seconds` is the one to reach for during an incident. Depth
+says how much is waiting; lag says how long it has been waiting, which is what
+decides whether a backlog is actually hurting.
+
+#### Behaviour
+
+| Metric | What it tells you |
+|---|---|
+| `ichnos_station_writes_total{type,action}` | The state machine's decisions: `new`, `change`, `confirm`, `replace`, `block`, `new_block`, `nothing`. New stations per day and blocks per day both come from here. |
+| `ichnos_elision_total{decision}` | `write` against `skip`. The skip share is the write saving. |
+| `ichnos_fold_ratio`, `ichnos_fold_ratio_hist` | Observations per station. Towards one means folding has stopped saving anything. |
+| `ichnos_reports_dropped_total{reason}` | Why incoming data was rejected, one label per reason. |
+| `ichnos_observation_source_total{source}` | `gnss`, `fused`, `fixed`, `query`. |
+| `ichnos_cache_total{result}` | `hit`, `miss`, `negative`, `corrupt`. A falling hit rate is the cheapest thing to fix. |
+| `ichnos_lease_events_total{event}` | `claimed`, `renewed`, `released`, `lost`. A rising `lost` means workers are taking shards from each other. |
+| `ichnos_leases_held`, `ichnos_leases_target`, `ichnos_workers_live` | A lasting gap between held and target means a rebalance is stuck. |
+
+#### Quality
+
+These move slowly and no alert fires on them. They are the only numbers that
+say whether the service is good at its job.
+
+| Metric | What it tells you |
+|---|---|
+| `ichnos_locate_accuracy_meters{source}` | How precise the answers actually were. |
+| `ichnos_locate_coverage` | Known networks over asked-about networks. |
+| `ichnos_locate_no_answer_total{reason}` | `nothing_submitted`, `none_known`, `no_cluster`, `store_unavailable`. `none_known` is a coverage problem; `no_cluster` is not. |
+| `ichnos_locate_disagreement_meters` | How far the runner-up candidate sat from the winner. One device should not see two sets of stations that disagree by kilometres; when it does, either the stations are wrong or the report is not honest. |
+| `ichnos_locate_cluster_size{source}`, `ichnos_locate_score{source}` | How much evidence stood behind each answer. |
+| `ichnos_locate_stale_networks_total` | Stations used in an answer that were last confirmed before today. |
+| `ichnos_station_moved_meters` | How far stations move when they move. A settled station moves centimetres; a new tail at kilometres means something changed or something is lying. |
+| `ichnos_observation_speed_mps` | Reporter speed. The lowest bucket is a stationary vehicle, which for a ride-hailing fleet is the same spot counted over and over. |
+| `ichnos_observation_weight`, `ichnos_observation_accuracy_meters`, `ichnos_observation_age_ms` | The shape of the incoming data. |
+
+The four per-observation histograms sit on the hottest path there is. Set
+`metrics.observation_detail = false` to switch them off once the weights stop
+changing.
+
+#### Latency
+
+`ichnos_db_operation_seconds{op}`, `ichnos_cache_operation_seconds{op}`,
+`ichnos_queue_publish_seconds`, `ichnos_shard_drain_seconds`,
+`ichnos_db_batch_seconds`, `ichnos_shard_batch_observations`.
 
 ### When things break
 

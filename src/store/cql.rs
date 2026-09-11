@@ -12,6 +12,7 @@
 
 use super::{ApiKey, Result, Station, Store, StoreError};
 use crate::config::Cql as CqlCfg;
+use crate::metrics::{metrics, Timer};
 use crate::model::key::{CellKey, Radio, StationKind, WifiKey};
 use crate::model::observation::ReportSource;
 use crate::model::StationKey;
@@ -467,18 +468,27 @@ impl Store for CqlStore {
         if keys.is_empty() {
             return Ok(vec![]);
         }
+        let m = metrics();
+        let timer = Timer::start();
         let lookups: Vec<_> = keys.iter().map(|key| self.get_one(key)).collect();
         let found: Vec<Result<Option<Station>>> = stream::iter(lookups)
             .buffer_unordered(self.cfg.read_concurrency.max(1))
             .collect()
             .await;
+        timer.observe(&m.db_operation_seconds, "get_stations");
 
         let mut out = Vec::with_capacity(keys.len());
         for entry in found {
-            if let Some(station) = entry? {
-                out.push(station);
+            match entry {
+                Ok(Some(station)) => out.push(station),
+                Ok(None) => {}
+                Err(e) => {
+                    m.db_errors.with_label_values(&["get_stations"]).inc();
+                    return Err(e);
+                }
             }
         }
+        m.db_rows.with_label_values(&["read"]).inc_by(out.len() as u64);
         Ok(out)
     }
 
@@ -486,14 +496,22 @@ impl Store for CqlStore {
         if stations.is_empty() {
             return Ok(());
         }
+        let m = metrics();
+        let timer = Timer::start();
         let writes: Vec<_> = stations.iter().map(|station| self.put_one(station)).collect();
         let results: Vec<Result<()>> = stream::iter(writes)
             .buffer_unordered(self.cfg.write_concurrency.max(1))
             .collect()
             .await;
+        timer.observe(&m.db_operation_seconds, "put_stations");
+
         for result in results {
-            result?;
+            if let Err(e) = result {
+                m.db_errors.with_label_values(&["put_stations"]).inc();
+                return Err(e);
+            }
         }
+        m.db_rows.with_label_values(&["written"]).inc_by(stations.len() as u64);
         Ok(())
     }
 
@@ -539,6 +557,7 @@ impl Store for CqlStore {
     }
 
     async fn get_api_key(&self, key: &str) -> Result<Option<ApiKey>> {
+        let _timer = ApiKeyTimer::start();
         let result = self
             .session
             .execute_unpaged(&self.statements.select_api_key, (key,))
@@ -596,6 +615,24 @@ impl Store for CqlStore {
 /// Both sides must be `host:port`; a bare host would be ambiguous about which
 /// port it meant, and silently guessing would produce a timeout far from its
 /// cause.
+/// Times the key lookup whichever way its several branches return.
+struct ApiKeyTimer(std::time::Instant);
+
+impl ApiKeyTimer {
+    fn start() -> Self {
+        Self(std::time::Instant::now())
+    }
+}
+
+impl Drop for ApiKeyTimer {
+    fn drop(&mut self) {
+        metrics()
+            .db_operation_seconds
+            .with_label_values(&["get_api_key"])
+            .observe(self.0.elapsed().as_secs_f64());
+    }
+}
+
 fn parse_address_map(
     map: &std::collections::BTreeMap<String, String>,
 ) -> Result<std::collections::HashMap<std::net::SocketAddr, std::net::SocketAddr>> {

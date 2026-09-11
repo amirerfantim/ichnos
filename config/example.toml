@@ -54,3 +54,13 @@ budget_days = 10
 [api]
 max_networks = 20
 require_keys = true
+
+[metrics]
+# Sample queue depth in the background. Off leaves the depth gauges empty,
+# which costs the earliest warning the service has.
+poll_enabled = true
+poll_secs = 15
+# Record each kept observation's weight, claimed accuracy, reporter speed and
+# scan age. Four histogram writes per observation, on the hottest path there
+# is. Worth it while tuning; worth turning off once the answers settle.
+observation_detail = true

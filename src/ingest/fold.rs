@@ -42,6 +42,22 @@ pub enum Action {
     Nothing,
 }
 
+impl Action {
+    /// A stable metric label. These are the most valuable labels the service
+    /// has: the mix of decisions is what the write path is actually doing.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Action::New => "new",
+            Action::NewBlock => "new_block",
+            Action::Change => "change",
+            Action::Replace => "replace",
+            Action::Confirm => "confirm",
+            Action::Block => "block",
+            Action::Nothing => "nothing",
+        }
+    }
+}
+
 /// A station update ready to be written.
 #[derive(Debug, Clone)]
 pub struct StationUpdate {
@@ -426,6 +442,25 @@ mod tests {
         s.source = Some(ReportSource::Gnss);
         s.last_seen = Some(now().date_naive() - Duration::days(1));
         s
+    }
+
+    #[test]
+    fn every_action_has_its_own_label() {
+        let all = [
+            Action::New,
+            Action::NewBlock,
+            Action::Change,
+            Action::Replace,
+            Action::Confirm,
+            Action::Block,
+            Action::Nothing,
+        ];
+        let mut seen = std::collections::HashSet::new();
+        for action in all {
+            let label = action.as_str();
+            assert!(!label.is_empty(), "{action:?} has no label");
+            assert!(seen.insert(label), "{label} is used by more than one action");
+        }
     }
 
     #[test]
