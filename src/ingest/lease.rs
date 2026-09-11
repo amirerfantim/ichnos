@@ -39,12 +39,33 @@ pub trait Leases: Send + Sync + 'static {
 
     /// Who holds a shard, if anyone.
     async fn holder(&self, shard: u32) -> Result<Option<String>>;
+
+    /// Announce that this worker is alive, and refresh that announcement.
+    ///
+    /// Without it a worker cannot know how many siblings it has, and the first
+    /// one to start would take every shard and keep them: adding a second
+    /// worker would change nothing until the first one died.
+    async fn heartbeat(&self, owner: &str, ttl: Duration) -> Result<()>;
+
+    /// How many workers have announced themselves recently.
+    async fn live_workers(&self, ttl: Duration) -> Result<usize>;
+}
+
+/// How many shards one worker should hold, given how many workers there are.
+///
+/// Rounded up, so every shard has an owner even when the division is uneven.
+/// A worker holding more than this releases the excess, which is what lets a
+/// new worker pick up work without waiting for an old one to die.
+pub fn fair_share(shards: u32, workers: usize) -> u32 {
+    let workers = workers.max(1) as u32;
+    shards.div_ceil(workers)
 }
 
 /// An in-process lease registry for tests and single-process runs.
 #[derive(Clone, Default)]
 pub struct MemoryLeases {
     held: Arc<Mutex<HashMap<u32, (String, Instant)>>>,
+    workers: Arc<Mutex<HashMap<String, Instant>>>,
 }
 
 impl MemoryLeases {
@@ -56,6 +77,11 @@ impl MemoryLeases {
     /// renewing.
     pub fn expire(&self, shard: u32) {
         self.held.lock().expect("lease lock poisoned").remove(&shard);
+    }
+
+    /// Forget a worker immediately, standing in for one that died.
+    pub fn forget_worker(&self, owner: &str) {
+        self.workers.lock().expect("lease lock poisoned").remove(owner);
     }
 
     fn live(&self, shard: u32) -> Option<(String, Instant)> {
@@ -115,6 +141,21 @@ impl Leases for MemoryLeases {
 
     async fn holder(&self, shard: u32) -> Result<Option<String>> {
         Ok(self.live(shard).map(|(owner, _)| owner))
+    }
+
+    async fn heartbeat(&self, owner: &str, ttl: Duration) -> Result<()> {
+        self.workers
+            .lock()
+            .expect("lease lock poisoned")
+            .insert(owner.to_string(), Instant::now() + ttl);
+        Ok(())
+    }
+
+    async fn live_workers(&self, _ttl: Duration) -> Result<usize> {
+        let mut workers = self.workers.lock().expect("lease lock poisoned");
+        let now = Instant::now();
+        workers.retain(|_, until| *until > now);
+        Ok(workers.len())
     }
 }
 
@@ -220,6 +261,40 @@ mod tests {
     async fn releasing_a_shard_nobody_holds_is_harmless() {
         let leases = MemoryLeases::new();
         leases.release(7, "worker-a").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_fair_share_covers_every_shard_even_when_it_divides_unevenly() {
+        assert_eq!(fair_share(8, 1), 8);
+        assert_eq!(fair_share(8, 2), 4);
+        assert_eq!(fair_share(8, 3), 3, "3 each covers 8 with one to spare");
+        assert_eq!(fair_share(8, 8), 1);
+        assert_eq!(fair_share(8, 20), 1, "more workers than shards is not an error");
+        assert_eq!(fair_share(8, 0), 8, "and nor is claiming to have none");
+    }
+
+    #[tokio::test]
+    async fn workers_are_counted_while_they_keep_announcing_themselves() {
+        let leases = MemoryLeases::new();
+        assert_eq!(leases.live_workers(TTL).await.unwrap(), 0);
+
+        leases.heartbeat("a", TTL).await.unwrap();
+        leases.heartbeat("b", TTL).await.unwrap();
+        assert_eq!(leases.live_workers(TTL).await.unwrap(), 2);
+
+        leases.heartbeat("a", TTL).await.unwrap();
+        assert_eq!(leases.live_workers(TTL).await.unwrap(), 2, "repeats do not double-count");
+
+        leases.forget_worker("b");
+        assert_eq!(leases.live_workers(TTL).await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_worker_that_stops_announcing_itself_is_dropped_from_the_count() {
+        let leases = MemoryLeases::new();
+        leases.heartbeat("gone", Duration::from_millis(1)).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        assert_eq!(leases.live_workers(TTL).await.unwrap(), 0);
     }
 
     #[tokio::test]

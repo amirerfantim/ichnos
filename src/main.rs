@@ -210,6 +210,7 @@ async fn serve(cfg: Config, in_memory: bool, with_worker: bool) -> Result<()> {
             cfg.clone(),
             format!("inline-{}", identity()),
         );
+        worker.announce().await.map_err(|e| anyhow::anyhow!("announcing: {e}"))?;
         worker.claim_shards().await.map_err(|e| anyhow::anyhow!("claiming shards: {e}"))?;
         let rx = shutdown_rx.clone();
         tokio::spawn(async move { worker.run(rx).await });
@@ -268,6 +269,9 @@ async fn run_worker(cfg: Config, in_memory: bool, identity_arg: Option<String>) 
     });
 
     let mut worker = Worker::new(queue, store, leases, cfg, identity);
+    // Announce before claiming, or this worker counts itself as the only one
+    // and takes every shard before its siblings are visible.
+    worker.announce().await.map_err(|e| anyhow::anyhow!("announcing: {e}"))?;
     worker.claim_shards().await.map_err(|e| anyhow::anyhow!("claiming shards: {e}"))?;
     worker.run(rx).await;
     Ok(())
