@@ -70,7 +70,7 @@ curl -X POST 'localhost:8080/v1/geolocate?key=dev-key' \
       {"macAddress": "aabbccddee01", "signalStrength": -65},
       {"macAddress": "aabbccddee02", "signalStrength": -70}]}'
 
-# {"location":{"lat":52.3676,"lng":4.9041},"accuracy":10.0}
+# {"location":{"lat":52.367599999999996,"lng":4.904099999999999},"accuracy":10.0}
 ```
 
 With real storage:
