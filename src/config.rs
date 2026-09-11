@@ -411,7 +411,7 @@ impl Default for RedisCfg {
 pub struct Api {
     /// Networks accepted per request. Beyond this the extras are ignored.
     pub max_networks: usize,
-    /// Items accepted in one geosubmit body.
+    /// Reports accepted in one observations body.
     pub max_items: usize,
     /// Largest request body accepted, in bytes.
     pub max_body_bytes: usize,

@@ -88,7 +88,7 @@ async fn observations(
         // A body that will not parse is worth saying so about: it means the
         // client is broken, not that the data was poor.
         return finish(
-            "geosubmit",
+            "observations",
             started,
             (StatusCode::BAD_REQUEST, Json(ErrorResponse::invalid("Invalid request body")))
                 .into_response(),
@@ -154,7 +154,7 @@ async fn locate(
 
     let Ok(Json(request)) = body else {
         return finish(
-            "geolocate",
+            "locate",
             started,
             (StatusCode::BAD_REQUEST, Json(ErrorResponse::invalid("Invalid request body")))
                 .into_response(),
