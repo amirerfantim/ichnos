@@ -246,12 +246,12 @@ async fn the_redis_cache_stores_reads_and_forgets() {
     assert!(cache.healthy().await);
 
     let key = format!("test:{}", unique_mac().0);
-    assert_eq!(cache.get_many(&[key.clone()]).await, vec![None]);
+    assert_eq!(cache.get_many(std::slice::from_ref(&key)).await, vec![None]);
 
     cache.set_many(&[(key.clone(), "a value".into(), 60)]).await;
-    assert_eq!(cache.get_many(&[key.clone()]).await, vec![Some("a value".to_string())]);
+    assert_eq!(cache.get_many(std::slice::from_ref(&key)).await, vec![Some("a value".to_string())]);
 
-    cache.delete_many(&[key.clone()]).await;
+    cache.delete_many(std::slice::from_ref(&key)).await;
     assert_eq!(cache.get_many(&[key]).await, vec![None]);
     assert_eq!(cache.errors(), 0, "no operation should have failed");
 }
@@ -362,7 +362,7 @@ async fn workers_can_count_one_another_through_redis() {
     leases.heartbeat(&me, ttl).await.unwrap();
     let after = leases.live_workers(ttl).await.unwrap();
 
-    assert!(after >= before + 1, "announcing should make this worker visible");
+    assert!(after > before, "announcing should make this worker visible");
 }
 
 #[tokio::test]
