@@ -1,6 +1,6 @@
 # Build and runtime are separate so the shipped image carries no toolchain and
 # no source: it is the binary, its certificates, and nothing else.
-FROM rust:1.90-slim-bookworm AS build
+FROM rust:1.98-slim-bookworm AS build
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
       pkg-config libssl-dev ca-certificates \
