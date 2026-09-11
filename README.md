@@ -36,7 +36,7 @@ Ichnos keeps the algorithm and rebuilds the machine around it:
 | Write path | one read-modify-write per sighting, under a row lock | observations are folded per station, then written in one batch |
 | Concurrency | `SELECT ... FOR UPDATE` | one worker owns a shard, so no locks at all |
 | Unchanged stations | rewritten anyway | not written at all |
-| Scheduling | a scheduler hands out work on a timer | workers claim shards themselves |
+| Scheduling | a scheduler hands out work on a timer | workers claim shards themselves and rebalance |
 | Queue | unbounded | capped, drops oldest, counts what it dropped |
 | Reads | straight to the database | cached, including the misses |
 | Old data | never deleted | expires on its own |
@@ -133,6 +133,17 @@ report → validate → one message per station → hash(key) → shard stream
 Every sighting of a station is routed to the same shard by hashing its key, and
 exactly one worker owns a shard at a time. That single fact is what removes the
 locks: no two workers can ever touch the same row.
+
+Workers announce themselves in a registry that forgets anyone who goes quiet, so
+each one can see how many siblings it has and work out an equal share. A worker
+holding more than its share gives the excess back before claiming, which is what
+lets a newly started worker pick work up straight away rather than waiting for an
+older one to die. When a worker disappears, its lease lapses, its unacknowledged
+batch is redelivered, and the survivors take over on their next tick.
+
+Scale the deployment from one worker to six and the shards redistribute
+themselves. There is nothing to configure and no process whose death stops the
+pipeline.
 
 A worker drains a window of observations, groups them by station, and turns each
 group into one update. Twenty sightings of an access point become one row
