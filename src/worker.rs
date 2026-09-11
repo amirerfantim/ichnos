@@ -50,11 +50,41 @@ impl ShardOutcome {
     }
 }
 
-/// Drain one shard once and write what it produced.
+/// Drain one shard and write what it produced.
 ///
-/// Split out from the loop so it can be driven directly by tests and by the
-/// replay harness, neither of which want a running event loop or a lease.
+/// Keeps pulling while the shard still has work, rather than taking one batch
+/// and waiting for the next window: throughput would otherwise be capped at one
+/// batch per shard per window no matter how much was waiting, and the queue
+/// would grow without limit under any real load.
+///
+/// The batch cap stops one busy shard starving the others a worker also holds.
 pub async fn process_shard<Q: Queue + ?Sized, S: Store + ?Sized>(
+    queue: &Q,
+    store: &S,
+    shard: u32,
+    cfg: &Config,
+) -> Result<ShardOutcome, WorkerError> {
+    let mut total = ShardOutcome::default();
+    for _ in 0..cfg.ingest.max_drain_batches {
+        let outcome = drain_once(queue, store, shard, cfg).await?;
+        let drained = outcome.observations;
+        total.observations += outcome.observations;
+        total.stations += outcome.stations;
+        total.written += outcome.written;
+        total.skipped += outcome.skipped;
+        total.blocked += outcome.blocked;
+        total.created += outcome.created;
+        // A short read means the shard is empty, so there is nothing to come
+        // back for.
+        if drained < cfg.ingest.read_batch {
+            break;
+        }
+    }
+    Ok(total)
+}
+
+/// Take one batch from a shard, fold it, and write the result.
+async fn drain_once<Q: Queue + ?Sized, S: Store + ?Sized>(
     queue: &Q,
     store: &S,
     shard: u32,
@@ -457,6 +487,47 @@ mod tests {
         let station = store.get_station(&StationKey::Wifi(WifiKey(1))).await.unwrap().unwrap();
         assert!(!station.has_position());
         assert_eq!(station.block_count, 1);
+    }
+
+    #[tokio::test]
+    async fn a_shard_is_drained_until_it_is_empty_not_one_batch_at_a_time() {
+        // The bug this pins: draining one batch per window caps throughput at
+        // read_batch per shard per window no matter how much is waiting, so the
+        // queue grows without limit under any real load.
+        let mut cfg = cfg();
+        cfg.ingest.read_batch = 10;
+        cfg.ingest.max_drain_batches = 50;
+
+        let queue = MemoryQueue::new(cfg.ingest.shards, 10_000);
+        let store = MemoryStore::new();
+        let shard = observation(1, 35.7219, 51.3347).key.shard(cfg.ingest.shards);
+
+        // Far more than one batch, all for one station so they fold together.
+        let observations: Vec<Observation> =
+            (0..250).map(|_| observation(1, 35.7219, 51.3347)).collect();
+        publish(&queue, &cfg, observations).await;
+
+        let outcome = process_shard(&queue, &store, shard, &cfg).await.unwrap();
+        assert_eq!(outcome.observations, 250, "one pass should have taken all of it");
+        assert_eq!(queue.depth(shard).await.unwrap(), 0, "and left the shard empty");
+    }
+
+    #[tokio::test]
+    async fn one_busy_shard_cannot_be_drained_for_ever() {
+        // The cap is what stops a flooded shard starving the others a worker
+        // also holds.
+        let mut cfg = cfg();
+        cfg.ingest.read_batch = 10;
+        cfg.ingest.max_drain_batches = 3;
+
+        let queue = MemoryQueue::new(cfg.ingest.shards, 10_000);
+        let store = MemoryStore::new();
+        let shard = observation(1, 35.7219, 51.3347).key.shard(cfg.ingest.shards);
+        publish(&queue, &cfg, (0..250).map(|_| observation(1, 35.7219, 51.3347)).collect()).await;
+
+        let outcome = process_shard(&queue, &store, shard, &cfg).await.unwrap();
+        assert_eq!(outcome.observations, 30, "three batches of ten, then it moves on");
+        assert!(queue.depth(shard).await.unwrap() > 0, "the rest waits for the next pass");
     }
 
     #[tokio::test]
