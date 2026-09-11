@@ -48,9 +48,11 @@ impl CommonQuery {
 
 pub fn router(state: AppState) -> Router {
     Router::new()
-        .route("/v2/geosubmit", post(geosubmit))
-        .route("/v1/geolocate", post(geolocate))
-        .route("/v1/submit", post(geosubmit))
+        // A noun for the collection you write to, a verb for the question you
+        // ask. Posting observations creates records; locating computes an
+        // answer and stores nothing.
+        .route("/v1/observations", post(observations))
+        .route("/v1/locate", post(locate))
         .route("/debug/station/{kind}/{key}", get(debug_station))
         .route("/health", get(health))
         .route("/ready", get(ready))
@@ -58,14 +60,14 @@ pub fn router(state: AppState) -> Router {
         .with_state(state)
 }
 
-// ------------------------------------------------------------- geosubmit ----
+// ---------------------------------------------------------- observations ----
 
 /// Accept a batch of reports.
 ///
 /// Always answers 200, even when every report was rejected. Clients fire this
 /// and forget it, so failing them over data quality gains nothing and loses the
 /// reports that were fine. What happened is visible in the metrics instead.
-async fn geosubmit(
+async fn observations(
     State(state): State<AppState>,
     Query(query): Query<CommonQuery>,
     body: Result<Json<SubmitRequest>, axum::extract::rejection::JsonRejection>,
@@ -76,10 +78,10 @@ async fn geosubmit(
     let api_key =
         match state.keys.check(&*state.store, query.key.as_deref(), Permission::Submit).await {
             Ok(key) => key,
-            Err(e) => return finish("geosubmit", started, auth_response(e)),
+            Err(e) => return finish("observations", started, auth_response(e)),
         };
     if over_quota(&state, api_key.as_ref()).await {
-        return finish("geosubmit", started, quota_response());
+        return finish("observations", started, quota_response());
     }
 
     let Ok(Json(request)) = body else {
@@ -127,13 +129,13 @@ async fn geosubmit(
         }
     }
 
-    finish("geosubmit", started, (StatusCode::OK, Json(serde_json::json!({}))).into_response())
+    finish("observations", started, (StatusCode::OK, Json(serde_json::json!({}))).into_response())
 }
 
-// ------------------------------------------------------------- geolocate ----
+// --------------------------------------------------------------- locate ----
 
 /// Work out where a device is from the stations it can see.
-async fn geolocate(
+async fn locate(
     State(state): State<AppState>,
     Query(query): Query<CommonQuery>,
     body: Result<Json<LocateRequest>, axum::extract::rejection::JsonRejection>,
@@ -144,10 +146,10 @@ async fn geolocate(
     let api_key =
         match state.keys.check(&*state.store, query.key.as_deref(), Permission::Locate).await {
             Ok(key) => key,
-            Err(e) => return finish("geolocate", started, auth_response(e)),
+            Err(e) => return finish("locate", started, auth_response(e)),
         };
     if over_quota(&state, api_key.as_ref()).await {
-        return finish("geolocate", started, quota_response());
+        return finish("locate", started, quota_response());
     }
 
     let Ok(Json(request)) = body else {
@@ -165,7 +167,7 @@ async fn geolocate(
 
     if lookup.is_empty() {
         m.locate_results.with_label_values(&["none"]).inc();
-        return finish("geolocate", started, not_found());
+        return finish("locate", started, not_found());
     }
 
     let keys: Vec<StationKey> = lookup.keys();
@@ -175,7 +177,7 @@ async fn geolocate(
             tracing::warn!(error = %e, "station lookup failed");
             m.degraded.set(1);
             m.locate_results.with_label_values(&["error"]).inc();
-            return finish("geolocate", started, degraded_not_found());
+            return finish("locate", started, degraded_not_found());
         }
     };
     m.degraded.set(0);
@@ -190,7 +192,7 @@ async fn geolocate(
     let candidates = locate::candidates(wifi_networks.clone(), cell_networks.clone(), &state.cfg);
     let Some(answer) = locate::best(&candidates) else {
         m.locate_results.with_label_values(&["none"]).inc();
-        return finish("geolocate", started, not_found());
+        return finish("locate", started, not_found());
     };
 
     m.locate_results
@@ -209,7 +211,7 @@ async fn geolocate(
         accuracy: answer.accuracy,
         explain,
     };
-    finish("geolocate", started, (StatusCode::OK, Json(response)).into_response())
+    finish("locate", started, (StatusCode::OK, Json(response)).into_response())
 }
 
 /// The stations a request asked about, with what the client reported of each.

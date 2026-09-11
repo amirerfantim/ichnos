@@ -53,7 +53,8 @@ happen:
 
 ### Interface
 
-- `POST /v2/geosubmit` and `POST /v1/geolocate`, wire-compatible with Ichnaea.
+- `POST /v1/observations` and `POST /v1/locate`. The bodies are Ichnaea's, so a
+  client only changes which URL it posts to.
 - `?explain=1` returns the working behind an answer, and costs nothing when not
   asked for.
 - `GET /debug/station/{kind}/{key}` behind an admin key.
