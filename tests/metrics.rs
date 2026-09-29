@@ -22,6 +22,13 @@ use serde_json::{json, Value};
 use std::sync::Arc;
 use std::time::Duration;
 
+/// Held by every test that runs the depth poller.
+///
+/// The depth gauges are process-wide, and tests run in parallel: a poller
+/// sampling one test's queue would overwrite the value another test is about
+/// to read. Taking turns keeps each test's reading its own.
+static POLLER: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 struct Harness {
     server: TestServer,
     queue: Arc<MemoryQueue>,
@@ -130,6 +137,7 @@ async fn every_declared_metric_family_is_actually_written_by_some_code_path() {
     h.locate_as("write-only", ask(&macs)).await;
 
     // Depth gauges are sampled, not written inline.
+    let _turn = POLLER.lock().await;
     let (tx, rx) = tokio::sync::watch::channel(false);
     let queue = h.queue.clone();
     let poller = tokio::spawn(async move {
@@ -281,6 +289,7 @@ async fn queue_depth_is_sampled_rather_than_left_empty() {
     };
     assert!(waiting > 0, "the submit should have queued something to measure");
 
+    let _turn = POLLER.lock().await;
     let (tx, rx) = tokio::sync::watch::channel(false);
     let queue = h.queue.clone();
     let shards = h.cfg.ingest.shards;
@@ -330,6 +339,7 @@ async fn trimmed_entries_are_reported_as_a_step_not_as_a_total() {
         sample(&text, "ichnos_stream_trimmed_total").unwrap_or(0.0)
     };
 
+    let _turn = POLLER.lock().await;
     let (tx, rx) = tokio::sync::watch::channel(false);
     let q = queue.clone();
     let poller = tokio::spawn(async move {
@@ -370,3 +380,4 @@ async fn coverage_falls_when_the_service_knows_less_than_it_was_asked_about() {
     // Half of four is 0.5, so the 0.5 bucket must have caught it.
     assert!(text.contains("ichnos_locate_coverage_bucket"));
 }
+
