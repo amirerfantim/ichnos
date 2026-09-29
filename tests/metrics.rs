@@ -381,3 +381,29 @@ async fn coverage_falls_when_the_service_knows_less_than_it_was_asked_about() {
     assert!(text.contains("ichnos_locate_coverage_bucket"));
 }
 
+/// A redelivery is the one sign that workers are dying or failing to write
+/// while the queue still looks healthy, so it has to be counted.
+#[tokio::test]
+async fn a_redelivered_entry_is_counted() {
+    let queue = MemoryQueue::new(1, 100).with_redeliver_after(Duration::ZERO);
+    let observation = ichnos::model::Observation {
+        key: ichnos::model::StationKey::Wifi(ichnos::model::key::WifiKey(1)),
+        lat: 35.7219,
+        lon: 51.3347,
+        accuracy: Some(10.0),
+        age_ms: Some(0.0),
+        speed: Some(0.0),
+        signal: Some(-70),
+        source: ichnos::model::ReportSource::Gnss,
+        timestamp: 1_700_000_000_000,
+    };
+    queue.publish(&[(0, observation)]).await.unwrap();
+    queue.read(0, 10).await.unwrap();
+
+    let before = sample(&ichnos::metrics::metrics().render(), "ichnos_queue_redelivered_total")
+        .unwrap_or(0.0);
+    assert_eq!(queue.read(0, 10).await.unwrap().len(), 1);
+    let after = sample(&ichnos::metrics::metrics().render(), "ichnos_queue_redelivered_total")
+        .unwrap_or(0.0);
+    assert!(after >= before + 1.0, "{before} -> {after}");
+}

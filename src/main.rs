@@ -169,17 +169,25 @@ async fn build_store(cfg: &Config, in_memory: bool) -> Result<Arc<dyn Store>> {
 
 async fn build_queue(cfg: &Config, in_memory: bool, consumer: String) -> Result<Arc<dyn Queue>> {
     if in_memory {
-        return Ok(Arc::new(MemoryQueue::new(cfg.ingest.shards, cfg.ingest.stream_maxlen)));
+        return Ok(Arc::new(
+            MemoryQueue::new(cfg.ingest.shards, cfg.ingest.stream_maxlen)
+                .with_redeliver_after(redeliver_after(cfg)),
+        ));
     }
     let queue = RedisQueue::connect(
         &cfg.redis.queue_url,
         cfg.ingest.shards,
         cfg.ingest.stream_maxlen,
         consumer,
+        redeliver_after(cfg),
     )
     .await
     .map_err(|e| anyhow::anyhow!("connecting to the queue: {e}"))?;
     Ok(Arc::new(queue))
+}
+
+fn redeliver_after(cfg: &Config) -> std::time::Duration {
+    std::time::Duration::from_secs(cfg.ingest.redeliver_after_secs)
 }
 
 /// Start sampling queue depth in the background, unless config says not to.

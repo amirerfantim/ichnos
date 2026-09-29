@@ -274,7 +274,7 @@ and **quality** says whether the answers are getting better or worse.
 `ichnos_http_requests_total{route,status}`, `ichnos_http_duration_seconds{route}`,
 `ichnos_http_in_flight{route}`, `ichnos_auth_total{route,result}`,
 `ichnos_quota_total{route,result}`, `ichnos_worker_errors_total{stage}`,
-`ichnos_db_errors_total{op}`, `ichnos_queue_errors_total{op}`,
+`ichnos_db_errors_total{op}`, `ichnos_queue_errors_total{op}`, `ichnos_queue_redelivered_total`,
 `ichnos_stream_depth{shard}`, `ichnos_stream_depth_total`,
 `ichnos_queue_lag_seconds`, `ichnos_build_info{version}`,
 `ichnos_start_time_seconds`.

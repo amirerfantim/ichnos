@@ -261,6 +261,15 @@ pub struct Ingest {
     /// waiting, and the queue grows without limit. The cap stops one busy
     /// shard starving the others.
     pub max_drain_batches: usize,
+    /// How long an entry may sit taken but unacknowledged before any worker
+    /// holding its shard takes it again.
+    ///
+    /// An entry is left unacknowledged when its worker died mid-batch, lost
+    /// its lease, or failed to write. Without this it would stay pending for
+    /// ever, because a normal read only returns entries never delivered. It
+    /// must be at least the lease TTL: any shorter and a batch could be taken
+    /// from a worker that still owns the shard and is still writing it.
+    pub redeliver_after_secs: u64,
     /// Collapse repeats from one position bucket into a single weighted sample.
     /// Off by default, so counting matches Ichnaea exactly.
     pub collapse_by_position: bool,
@@ -276,6 +285,7 @@ impl Default for Ingest {
             stream_maxlen: 200_000,
             read_batch: 5_000,
             max_drain_batches: 50,
+            redeliver_after_secs: 30,
             collapse_by_position: false,
             collapse_bucket_m: 10.0,
         }
@@ -539,6 +549,13 @@ impl Config {
                 self.lease.renew_secs, self.lease.ttl_secs
             ));
         }
+        if self.ingest.redeliver_after_secs < self.lease.ttl_secs {
+            return bad(format!(
+                "ingest.redeliver_after_secs ({}) must be at least lease.ttl_secs ({}), or a \
+                 batch can be taken from a worker that still owns its shard",
+                self.ingest.redeliver_after_secs, self.lease.ttl_secs
+            ));
+        }
         if self.metrics.poll_enabled && self.metrics.poll_secs == 0 {
             return bad("metrics.poll_secs must be at least 1 when polling is on".into());
         }
@@ -647,6 +664,16 @@ mod tests {
         assert!(c.validate().is_err());
         c.lease.renew_secs = 0;
         assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn redelivery_sooner_than_a_lease_can_expire_is_rejected() {
+        let mut c = Config::for_tests();
+        c.lease.ttl_secs = 15;
+        c.ingest.redeliver_after_secs = 14;
+        assert!(c.validate().is_err(), "would take a batch from a live owner");
+        c.ingest.redeliver_after_secs = 15;
+        assert!(c.validate().is_ok(), "exactly one lease lifetime is enough");
     }
 
     #[test]

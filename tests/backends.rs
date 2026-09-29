@@ -283,7 +283,9 @@ async fn the_redis_queue_carries_observations_and_holds_them_until_acknowledged(
         return;
     };
     let consumer = format!("test-{}", unique_mac().0);
-    let queue = RedisQueue::connect(&url, 4, 1_000, consumer).await.expect("queue should connect");
+    let queue = RedisQueue::connect(&url, 4, 1_000, consumer, Duration::from_secs(30))
+        .await
+        .expect("queue should connect");
     assert!(queue.healthy().await);
 
     let shard = 3;
@@ -313,6 +315,102 @@ async fn the_redis_queue_carries_observations_and_holds_them_until_acknowledged(
 
     let ids: Vec<String> = entries.iter().map(|e| e.id.clone()).collect();
     queue.ack(shard, &ids).await.unwrap();
+}
+
+/// A stream no other test uses, emptied first so earlier runs leave nothing.
+///
+/// Stream names are fixed per shard, so a test that counts pending entries
+/// needs a shard to itself: the queues here are built with more shards than
+/// any other test asks for, and each test picks its own.
+async fn private_shard(url: &str, shard: u32) -> redis::aio::MultiplexedConnection {
+    let client = redis::Client::open(url).unwrap();
+    let mut conn = client.get_multiplexed_async_connection().await.unwrap();
+    let _: () = redis::cmd("DEL").arg(format!("obs:{shard}")).query_async(&mut conn).await.unwrap();
+    conn
+}
+
+async fn pending_in_group(conn: &mut redis::aio::MultiplexedConnection, shard: u32) -> i64 {
+    let reply: redis::Value = redis::cmd("XPENDING")
+        .arg(format!("obs:{shard}"))
+        .arg("ichnos")
+        .query_async(conn)
+        .await
+        .unwrap();
+    match reply {
+        redis::Value::Array(parts) => match parts.first() {
+            Some(redis::Value::Int(n)) => *n,
+            _ => 0,
+        },
+        _ => 0,
+    }
+}
+
+fn test_observation() -> Observation {
+    Observation {
+        key: StationKey::Wifi(unique_mac()),
+        lat: 35.7219,
+        lon: 51.3347,
+        accuracy: Some(10.0),
+        age_ms: Some(0.0),
+        speed: Some(0.0),
+        signal: Some(-70),
+        source: ReportSource::Gnss,
+        timestamp: 1_700_000_000_000,
+    }
+}
+
+#[tokio::test]
+async fn a_batch_taken_by_a_dead_worker_is_redelivered_to_the_next_one() {
+    let Some(url) = redis_queue_url() else {
+        eprintln!("skipped: ICHNOS_TEST_REDIS_QUEUE is not set");
+        return;
+    };
+    let shard = 41;
+    let mut conn = private_shard(&url, shard).await;
+    let wait = Duration::from_millis(300);
+    let dead = RedisQueue::connect(&url, 48, 1_000, "dead".into(), wait).await.unwrap();
+    let next = RedisQueue::connect(&url, 48, 1_000, "next".into(), wait).await.unwrap();
+
+    let observation = test_observation();
+    dead.publish(&[(shard, observation.clone())]).await.unwrap();
+    let taken = dead.read(shard, 100).await.unwrap();
+    assert_eq!(taken.len(), 1, "the first worker takes it, then dies");
+
+    assert!(next.read(shard, 100).await.unwrap().is_empty(), "too soon: its owner may be alive");
+
+    tokio::time::sleep(wait + Duration::from_millis(100)).await;
+    let redelivered = next.read(shard, 100).await.unwrap();
+    assert_eq!(redelivered.len(), 1, "the stuck batch comes back");
+    assert_eq!(redelivered[0].id, taken[0].id);
+    assert_eq!(redelivered[0].observation, observation);
+
+    next.ack(shard, &[redelivered[0].id.clone()]).await.unwrap();
+    assert_eq!(pending_in_group(&mut conn, shard).await, 0, "and once written, it is done");
+}
+
+#[tokio::test]
+async fn an_undecodable_entry_is_acknowledged_rather_than_redelivered_for_ever() {
+    let Some(url) = redis_queue_url() else {
+        eprintln!("skipped: ICHNOS_TEST_REDIS_QUEUE is not set");
+        return;
+    };
+    let shard = 42;
+    let mut conn = private_shard(&url, shard).await;
+    let queue =
+        RedisQueue::connect(&url, 48, 1_000, "reader".into(), Duration::ZERO).await.unwrap();
+
+    let _: String = redis::cmd("XADD")
+        .arg(format!("obs:{shard}"))
+        .arg("*")
+        .arg("o")
+        .arg("not json")
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+
+    assert!(queue.read(shard, 100).await.unwrap().is_empty());
+    assert_eq!(pending_in_group(&mut conn, shard).await, 0, "not left pending");
+    assert!(queue.read(shard, 100).await.unwrap().is_empty(), "and it does not come back");
 }
 
 #[tokio::test]
