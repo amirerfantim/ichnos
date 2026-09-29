@@ -15,6 +15,7 @@ use async_trait::async_trait;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 #[derive(Debug, thiserror::Error)]
 pub enum QueueError {
@@ -27,7 +28,7 @@ pub enum QueueError {
 pub type Result<T> = std::result::Result<T, QueueError>;
 
 /// One queued observation, with the handle needed to acknowledge it.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Entry {
     pub id: String,
     pub observation: Observation,
@@ -118,12 +119,20 @@ pub async fn poll_depth<Q: Queue + ?Sized>(
     }
 }
 
+/// An entry handed out and not yet acknowledged, and when it was handed out.
+type Pending = (Entry, Instant);
+
 /// An in-process queue for tests and single-process runs.
+///
+/// Behaves as the Redis queue does: an entry taken and never acknowledged is
+/// handed out again once it has waited `redeliver_after`.
 #[derive(Clone)]
 pub struct MemoryQueue {
     shards: Arc<Mutex<Vec<VecDeque<Entry>>>>,
-    pending: Arc<Mutex<Vec<Vec<Entry>>>>,
+    /// Taken but not acknowledged, with when each was last handed out.
+    pending: Arc<Mutex<Vec<Vec<Pending>>>>,
     maxlen: usize,
+    redeliver_after: Duration,
     trimmed: Arc<AtomicU64>,
     next_id: Arc<AtomicU64>,
     broken: Arc<std::sync::atomic::AtomicBool>,
@@ -135,10 +144,19 @@ impl MemoryQueue {
             shards: Arc::new(Mutex::new(vec![VecDeque::new(); shards as usize])),
             pending: Arc::new(Mutex::new(vec![Vec::new(); shards as usize])),
             maxlen,
+            redeliver_after: Duration::from_secs(
+                crate::config::Ingest::default().redeliver_after_secs,
+            ),
             trimmed: Arc::new(AtomicU64::new(0)),
             next_id: Arc::new(AtomicU64::new(1)),
             broken: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
+    }
+
+    /// How long an unacknowledged entry waits before it is handed out again.
+    pub fn with_redeliver_after(mut self, after: Duration) -> Self {
+        self.redeliver_after = after;
+        self
     }
 
     pub fn set_broken(&self, broken: bool) {
@@ -149,15 +167,6 @@ impl MemoryQueue {
     /// redelivered if the worker died now.
     pub fn pending_count(&self, shard: u32) -> usize {
         self.pending.lock().expect("queue lock poisoned")[shard as usize].len()
-    }
-
-    /// Put unacknowledged entries back at the front, as a redelivery would.
-    pub fn redeliver(&self, shard: u32) {
-        let mut pending = self.pending.lock().expect("queue lock poisoned");
-        let mut shards = self.shards.lock().expect("queue lock poisoned");
-        for entry in pending[shard as usize].drain(..).rev() {
-            shards[shard as usize].push_front(entry);
-        }
     }
 
     fn check(&self) -> Result<()> {
@@ -191,21 +200,40 @@ impl Queue for MemoryQueue {
 
     async fn read(&self, shard: u32, max: usize) -> Result<Vec<Entry>> {
         self.check()?;
+
+        // Entries left unacknowledged for long enough come first, as they do
+        // from Redis: their owner is gone or failed, and they are the oldest.
+        let now = Instant::now();
+        let mut pending = self.pending.lock().expect("queue lock poisoned");
+        let mut stale = Vec::new();
+        for (entry, taken) in pending[shard as usize].iter_mut() {
+            if stale.len() >= max {
+                break;
+            }
+            if now.duration_since(*taken) >= self.redeliver_after {
+                *taken = now;
+                stale.push(entry.clone());
+            }
+        }
+        if !stale.is_empty() {
+            crate::metrics::metrics().queue_redelivered.inc_by(stale.len() as u64);
+            return Ok(stale);
+        }
+
         let mut shards = self.shards.lock().expect("queue lock poisoned");
         let queue = &mut shards[shard as usize];
         let taken: Vec<Entry> =
             (0..max.min(queue.len())).filter_map(|_| queue.pop_front()).collect();
         drop(shards);
 
-        self.pending.lock().expect("queue lock poisoned")[shard as usize]
-            .extend(taken.iter().cloned());
+        pending[shard as usize].extend(taken.iter().cloned().map(|e| (e, now)));
         Ok(taken)
     }
 
     async fn ack(&self, shard: u32, ids: &[String]) -> Result<()> {
         self.check()?;
         let mut pending = self.pending.lock().expect("queue lock poisoned");
-        pending[shard as usize].retain(|e| !ids.contains(&e.id));
+        pending[shard as usize].retain(|(e, _)| !ids.contains(&e.id));
         Ok(())
     }
 
@@ -322,28 +350,72 @@ mod tests {
 
     #[tokio::test]
     async fn work_a_dead_worker_never_acknowledged_comes_back() {
-        let queue = MemoryQueue::new(1, 100);
+        let queue = MemoryQueue::new(1, 100).with_redeliver_after(Duration::ZERO);
         queue.publish(&[(0, observation(1)), (0, observation(2))]).await.unwrap();
 
-        queue.read(0, 10).await.unwrap(); // taken, then the worker dies
+        let first = queue.read(0, 10).await.unwrap(); // taken, then the worker dies
         assert_eq!(queue.depth(0).await.unwrap(), 0);
 
-        queue.redeliver(0);
-        assert_eq!(queue.depth(0).await.unwrap(), 2, "nothing was lost");
+        let again = queue.read(0, 10).await.unwrap();
+        let ids = |entries: &[Entry]| entries.iter().map(|e| e.id.clone()).collect::<Vec<_>>();
+        assert_eq!(ids(&again), ids(&first), "the same entries, nothing lost");
+
+        queue.ack(0, &ids(&again)).await.unwrap();
         assert_eq!(queue.pending_count(0), 0);
+        assert!(queue.read(0, 10).await.unwrap().is_empty(), "and once done, done");
+    }
+
+    #[tokio::test]
+    async fn an_unacknowledged_entry_waits_before_it_is_handed_out_again() {
+        // A worker still writing its batch must not have it taken away.
+        let queue = MemoryQueue::new(1, 100).with_redeliver_after(Duration::from_secs(3600));
+        queue.publish(&[(0, observation(1))]).await.unwrap();
+        queue.read(0, 10).await.unwrap();
+
+        assert!(queue.read(0, 10).await.unwrap().is_empty(), "too soon to take it back");
+        assert_eq!(queue.pending_count(0), 1);
+    }
+
+    #[tokio::test]
+    async fn redelivered_entries_come_before_new_ones() {
+        let queue = MemoryQueue::new(1, 100).with_redeliver_after(Duration::ZERO);
+        queue.publish(&[(0, observation(1))]).await.unwrap();
+        let old = queue.read(0, 10).await.unwrap();
+        queue.publish(&[(0, observation(2))]).await.unwrap();
+
+        let next = queue.read(0, 10).await.unwrap();
+        assert_eq!(next.len(), 1);
+        assert_eq!(next[0].id, old[0].id, "the stuck entry is the oldest, so it goes first");
+        queue.ack(0, &[next[0].id.clone()]).await.unwrap();
+
+        let fresh = queue.read(0, 10).await.unwrap();
+        assert_eq!(fresh.len(), 1);
+        assert_ne!(fresh[0].id, old[0].id);
+    }
+
+    #[tokio::test]
+    async fn redelivery_respects_the_read_limit() {
+        let queue = MemoryQueue::new(1, 100).with_redeliver_after(Duration::ZERO);
+        queue
+            .publish(&[(0, observation(1)), (0, observation(2)), (0, observation(3))])
+            .await
+            .unwrap();
+        queue.read(0, 10).await.unwrap();
+        assert_eq!(queue.read(0, 2).await.unwrap().len(), 2);
     }
 
     #[tokio::test]
     async fn a_partial_acknowledgement_leaves_the_rest_pending() {
-        let queue = MemoryQueue::new(1, 100);
+        let queue = MemoryQueue::new(1, 100).with_redeliver_after(Duration::ZERO);
         queue.publish(&[(0, observation(1)), (0, observation(2))]).await.unwrap();
         let read = queue.read(0, 10).await.unwrap();
 
         queue.ack(0, &[read[0].id.clone()]).await.unwrap();
         assert_eq!(queue.pending_count(0), 1);
 
-        queue.redeliver(0);
-        assert_eq!(queue.depth(0).await.unwrap(), 1, "only the unacknowledged one returns");
+        let again = queue.read(0, 10).await.unwrap();
+        assert_eq!(again.len(), 1, "only the unacknowledged one returns");
+        assert_eq!(again[0].id, read[1].id);
     }
 
     #[tokio::test]

@@ -114,6 +114,8 @@ pub struct RedisQueue {
     maxlen: usize,
     group: String,
     consumer: String,
+    /// How long an entry sits unacknowledged before it is taken again.
+    redeliver_after: std::time::Duration,
     trimmed: Arc<AtomicU64>,
 }
 
@@ -123,12 +125,14 @@ impl RedisQueue {
         shards: u32,
         maxlen: usize,
         consumer: String,
+        redeliver_after: std::time::Duration,
     ) -> Result<Self, String> {
         let queue = Self {
             conn: connect(url).await?,
             maxlen,
             group: "ichnos".into(),
             consumer,
+            redeliver_after,
             trimmed: Arc::new(AtomicU64::new(0)),
         };
         for shard in 0..shards {
@@ -158,7 +162,64 @@ impl RedisQueue {
             Err(e) => Err(e.to_string()),
         }
     }
+
+    /// Take over entries that have sat unacknowledged for too long, up to
+    /// `max`, whichever consumer they were delivered to.
+    ///
+    /// Only the shard's lease holder reads the shard, and the wait is at least
+    /// one lease lifetime, so an entry taken here belongs to a worker that is
+    /// gone or has already given up on it. Returns the decoded entries and the
+    /// ids of any that could not be decoded.
+    async fn reclaim(
+        &self,
+        shard: u32,
+        max: usize,
+    ) -> Result<(Vec<Entry>, Vec<String>), QueueError> {
+        let mut conn = self.conn.clone();
+        let idle_ms = self.redeliver_after.as_millis() as u64;
+        let mut cursor = "0-0".to_string();
+        let mut entries = Vec::new();
+        let mut malformed = Vec::new();
+
+        // One call scans at most `count` pending entries, so a long pending
+        // list takes a few calls. The bound keeps a huge one from stalling
+        // the shard; what is left is picked up on the next read.
+        for _ in 0..MAX_RECLAIM_CALLS {
+            let wanted = max - entries.len();
+            let reply: redis::Value = redis::cmd("XAUTOCLAIM")
+                .arg(Self::stream(shard))
+                .arg(&self.group)
+                .arg(&self.consumer)
+                .arg(idle_ms)
+                .arg(&cursor)
+                .arg("COUNT")
+                .arg(wanted)
+                .query_async(&mut conn)
+                .await
+                .map_err(|e| QueueError::Failed(e.to_string()))?;
+
+            let redis::Value::Array(parts) = reply else { break };
+            let next = parts.first().and_then(as_string).unwrap_or_else(|| "0-0".into());
+            if let Some(redis::Value::Array(claimed)) = parts.get(1) {
+                let (good, bad) = parse_entries(claimed);
+                entries.extend(good);
+                malformed.extend(bad);
+            }
+            if next == "0-0" || entries.len() >= max {
+                break;
+            }
+            cursor = next;
+        }
+
+        if !entries.is_empty() {
+            crate::metrics::metrics().queue_redelivered.inc_by(entries.len() as u64);
+        }
+        Ok((entries, malformed))
+    }
 }
+
+/// Upper bound on XAUTOCLAIM calls in one read.
+const MAX_RECLAIM_CALLS: usize = 8;
 
 #[async_trait]
 impl Queue for RedisQueue {
@@ -193,21 +254,39 @@ impl Queue for RedisQueue {
     }
 
     async fn read(&self, shard: u32, max: usize) -> Result<Vec<Entry>, QueueError> {
-        let mut conn = self.conn.clone();
-        let reply: redis::Value = redis::cmd("XREADGROUP")
-            .arg("GROUP")
-            .arg(&self.group)
-            .arg(&self.consumer)
-            .arg("COUNT")
-            .arg(max)
-            .arg("STREAMS")
-            .arg(Self::stream(shard))
-            .arg(">")
-            .query_async(&mut conn)
-            .await
-            .map_err(|e| QueueError::Failed(e.to_string()))?;
+        // Stuck entries first. `>` below only ever returns entries never
+        // delivered to anyone, so without this an entry whose worker died,
+        // lost the shard, or failed to write would stay pending for ever.
+        let (mut entries, mut malformed) = self.reclaim(shard, max).await?;
+        if entries.is_empty() {
+            let mut conn = self.conn.clone();
+            let reply: redis::Value = redis::cmd("XREADGROUP")
+                .arg("GROUP")
+                .arg(&self.group)
+                .arg(&self.consumer)
+                .arg("COUNT")
+                .arg(max)
+                .arg("STREAMS")
+                .arg(Self::stream(shard))
+                .arg(">")
+                .query_async(&mut conn)
+                .await
+                .map_err(|e| QueueError::Failed(e.to_string()))?;
+            let (fresh, bad) = parse_stream_reply(&reply);
+            entries = fresh;
+            malformed.extend(bad);
+        }
 
-        Ok(parse_stream_reply(&reply))
+        // An entry that cannot be decoded never will be. Acknowledge it now,
+        // or it would come back on every read for ever.
+        if !malformed.is_empty() {
+            crate::metrics::metrics()
+                .queue_errors
+                .with_label_values(&["decode"])
+                .inc_by(malformed.len() as u64);
+            self.ack(shard, &malformed).await?;
+        }
+        Ok(entries)
     }
 
     async fn ack(&self, shard: u32, ids: &[String]) -> Result<(), QueueError> {
@@ -250,40 +329,53 @@ impl Queue for RedisQueue {
 
 /// Pull entries out of an XREADGROUP reply.
 ///
-/// The shape is streams, then entries, then a flat field/value list. Anything
-/// that does not parse is skipped rather than failing the batch: one malformed
-/// entry should not stop a shard.
-fn parse_stream_reply(reply: &redis::Value) -> Vec<Entry> {
-    let mut out = Vec::new();
+/// The shape is streams, then entries. Returns the decoded entries and the ids
+/// of those that did not decode: one malformed entry should not stop a shard,
+/// but it must still be acknowledged, or it would come back for ever.
+fn parse_stream_reply(reply: &redis::Value) -> (Vec<Entry>, Vec<String>) {
+    let mut out = (Vec::new(), Vec::new());
     let redis::Value::Array(streams) = reply else {
         return out;
     };
     for stream in streams {
         let redis::Value::Array(parts) = stream else { continue };
         let Some(redis::Value::Array(entries)) = parts.get(1) else { continue };
-        for entry in entries {
-            let redis::Value::Array(fields) = entry else { continue };
-            let Some(id) = fields.first().and_then(as_string) else { continue };
-            let Some(redis::Value::Array(pairs)) = fields.get(1) else { continue };
+        let (good, bad) = parse_entries(entries);
+        out.0.extend(good);
+        out.1.extend(bad);
+    }
+    out
+}
+
+/// Decode a list of stream entries, each an id and a flat field/value list.
+///
+/// An entry with no readable id cannot be acknowledged and is skipped. One
+/// with an id but no decodable observation is returned as malformed.
+fn parse_entries(entries: &[redis::Value]) -> (Vec<Entry>, Vec<String>) {
+    let mut good = Vec::new();
+    let mut bad = Vec::new();
+    for entry in entries {
+        let redis::Value::Array(fields) = entry else { continue };
+        let Some(id) = fields.first().and_then(as_string) else { continue };
+        let mut observation = None;
+        if let Some(redis::Value::Array(pairs)) = fields.get(1) {
             // Fields arrive as name, value, name, value.
-            let mut payload = None;
             for pair in pairs.chunks(2) {
                 if let (Some(name), Some(value)) =
                     (pair.first().and_then(as_string), pair.get(1).and_then(as_string))
                 {
                     if name == "o" {
-                        payload = Some(value);
+                        observation = serde_json::from_str::<Observation>(&value).ok();
                     }
                 }
             }
-            if let Some(payload) = payload {
-                if let Ok(observation) = serde_json::from_str::<Observation>(&payload) {
-                    out.push(Entry { id, observation });
-                }
-            }
+        }
+        match observation {
+            Some(observation) => good.push(Entry { id, observation }),
+            None => bad.push(id),
         }
     }
-    out
+    (good, bad)
 }
 
 fn as_string(value: &redis::Value) -> Option<String> {
@@ -495,14 +587,15 @@ mod tests {
             ])]),
         ])]);
 
-        let entries = parse_stream_reply(&reply);
+        let (entries, malformed) = parse_stream_reply(&reply);
+        assert!(malformed.is_empty());
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].id, "1700000000000-0");
         assert_eq!(entries[0].observation.lat, 35.7219);
     }
 
     #[test]
-    fn an_unparsable_entry_is_skipped_rather_than_failing_the_batch() {
+    fn an_unparsable_entry_is_set_aside_rather_than_failing_the_batch() {
         let reply = redis::Value::Array(vec![redis::Value::Array(vec![
             bulk("obs:0"),
             redis::Value::Array(vec![redis::Value::Array(vec![
@@ -510,13 +603,33 @@ mod tests {
                 redis::Value::Array(vec![bulk("o"), bulk("not json")]),
             ])]),
         ])]);
-        assert!(parse_stream_reply(&reply).is_empty());
+        let (entries, malformed) = parse_stream_reply(&reply);
+        assert!(entries.is_empty());
+        assert_eq!(malformed, vec!["1-0".to_string()], "returned so it can be acknowledged");
+    }
+
+    #[test]
+    fn an_entry_without_the_observation_field_is_malformed() {
+        let entries = vec![
+            redis::Value::Array(vec![bulk("2-0"), redis::Value::Array(vec![bulk("x"), bulk("1")])]),
+            redis::Value::Array(vec![bulk("3-0")]),
+        ];
+        let (good, bad) = parse_entries(&entries);
+        assert!(good.is_empty());
+        assert_eq!(bad, vec!["2-0".to_string(), "3-0".to_string()]);
+    }
+
+    #[test]
+    fn an_entry_without_a_readable_id_is_skipped_because_it_cannot_be_acknowledged() {
+        let entries = vec![redis::Value::Array(vec![redis::Value::Nil]), redis::Value::Nil];
+        let (good, bad) = parse_entries(&entries);
+        assert!(good.is_empty() && bad.is_empty());
     }
 
     #[test]
     fn an_empty_reply_is_no_entries_rather_than_an_error() {
-        assert!(parse_stream_reply(&redis::Value::Nil).is_empty());
-        assert!(parse_stream_reply(&redis::Value::Array(vec![])).is_empty());
+        assert_eq!(parse_stream_reply(&redis::Value::Nil), (vec![], vec![]));
+        assert_eq!(parse_stream_reply(&redis::Value::Array(vec![])), (vec![], vec![]));
     }
 
     #[test]

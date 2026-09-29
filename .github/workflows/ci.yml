@@ -12,6 +12,18 @@ env:
 jobs:
   test:
     runs-on: ubuntu-latest
+    # A real Redis, so the queue, lease and cache tests in tests/backends.rs
+    # run instead of skipping. Redelivery in particular only exists in Redis.
+    services:
+      redis:
+        image: redis:7-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping" --health-interval 5s
+          --health-timeout 3s --health-retries 10
+    env:
+      ICHNOS_TEST_REDIS: redis://127.0.0.1:6379/0
+      ICHNOS_TEST_REDIS_QUEUE: redis://127.0.0.1:6379/1
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
