@@ -115,6 +115,7 @@ pub struct Metrics {
     pub stream_trimmed: IntCounter,
     pub queue_publish_seconds: Histogram,
     pub queue_errors: IntCounterVec,
+    pub queue_redelivered: IntCounter,
     /// How long the oldest observation in a drained batch had waited.
     pub queue_lag_seconds: Histogram,
 
@@ -317,6 +318,11 @@ impl Metrics {
                 "ichnos_queue_errors_total",
                 "Queue operations that failed, by operation",
                 &["op"],
+            ),
+            queue_redelivered: counter(
+                "ichnos_queue_redelivered_total",
+                "Queue entries taken again after sitting unacknowledged; a steady rise means \
+                 workers are dying or failing to write",
             ),
             queue_lag_seconds: histogram(
                 "ichnos_queue_lag_seconds",

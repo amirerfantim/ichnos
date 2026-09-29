@@ -640,7 +640,7 @@ mod tests {
     #[tokio::test]
     async fn a_batch_is_acknowledged_only_after_it_is_written() {
         let cfg = cfg();
-        let queue = MemoryQueue::new(cfg.ingest.shards, 1_000);
+        let queue = MemoryQueue::new(cfg.ingest.shards, 1_000).with_redeliver_after(Duration::ZERO);
         let store = MemoryStore::new();
         let shard = observation(1, 35.7219, 51.3347).key.shard(cfg.ingest.shards);
         publish(&queue, &cfg, vec![observation(1, 35.7219, 51.3347)]).await;
@@ -649,12 +649,48 @@ mod tests {
         assert!(process_shard(&queue, &store, shard, &cfg).await.is_err());
         assert_eq!(queue.pending_count(shard), 1, "still unacknowledged");
 
-        // Which means redelivery recovers it once the store is back.
-        queue.redeliver(shard);
+        // Which means the next pass takes it again once the store is back,
+        // with no one having to put it back by hand.
         store.set_failing(false);
         let outcome = process_shard(&queue, &store, shard, &cfg).await.unwrap();
         assert_eq!(outcome.written, 1, "nothing was lost");
         assert_eq!(queue.pending_count(shard), 0);
+    }
+
+    #[tokio::test]
+    async fn a_batch_taken_by_a_worker_that_died_is_written_by_the_one_that_takes_over() {
+        let cfg = cfg();
+        let queue = Arc::new(
+            MemoryQueue::new(cfg.ingest.shards, 1_000).with_redeliver_after(Duration::ZERO),
+        );
+        let store = Arc::new(MemoryStore::new());
+        let leases = Arc::new(MemoryLeases::new());
+        let obs = observation(7, 35.7219, 51.3347);
+        let shard = obs.key.shard(cfg.ingest.shards);
+        publish(&queue, &cfg, vec![obs]).await;
+
+        // The first worker takes the batch and dies before writing it.
+        let mut dead =
+            Worker::new(queue.clone(), store.clone(), leases.clone(), cfg.clone(), "a".into());
+        dead.announce().await.unwrap();
+        dead.claim_shards().await.unwrap();
+        assert_eq!(queue.read(shard, 100).await.unwrap().len(), 1);
+        for held in dead.held_shards() {
+            leases.expire(held);
+        }
+        leases.forget_worker("a");
+        assert_eq!(store.len(), 0);
+
+        // The next worker to hold the shard finds the batch and writes it.
+        let mut next = Worker::new(queue.clone(), store.clone(), leases, cfg, "b".into());
+        next.announce().await.unwrap();
+        next.claim_shards().await.unwrap();
+        assert!(next.held_shards().contains(&shard));
+        let outcome = next.process_held().await;
+
+        assert_eq!(outcome.written, 1, "the dead worker's batch was not lost");
+        assert_eq!(store.len(), 1);
+        assert_eq!(queue.pending_count(shard), 0, "and it is acknowledged now");
     }
 
     #[tokio::test]

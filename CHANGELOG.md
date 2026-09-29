@@ -4,6 +4,22 @@
 
 ### Fixed
 
+- **A batch that was taken and never acknowledged stayed pending for ever.**
+  The documentation said a dead worker's batch is redelivered. It was not: the
+  Redis queue only ever read entries never delivered to anyone
+  (`XREADGROUP … >`), and nothing took over another consumer's pending
+  entries. A worker that died mid-batch, lost its shard, or failed to write
+  left those observations stuck in Redis, uncounted and never learned. A read
+  now first takes entries that have waited longer than
+  `ingest.redeliver_after_secs` (`XAUTOCLAIM`), then new ones. The in-memory
+  queue behaved correctly only because tests put entries back by hand; it now
+  redelivers on its own, the same way Redis does, and the manual step is gone.
+- An entry that could not be decoded was skipped but never acknowledged. With
+  redelivery it would have come back on every read; it is now acknowledged
+  and counted as `ichnos_queue_errors_total{op="decode"}`.
+- `tests/metrics.rs` could fail at random: tests running the depth poller in
+  parallel overwrote each other's process-wide gauges. They now take turns.
+
 - **Five declared metrics were never written by any code path.** The metrics
   module named `ichnos_stream_depth` and `ichnos_fold_ratio` as two of the
   three an operator watches, and nothing set either of them. Also dead:
@@ -17,6 +33,11 @@
   path in the service. Labels are now static.
 
 ### Added
+
+- `ingest.redeliver_after_secs` (default 30, at least `lease.ttl_secs`) and
+  `ichnos_queue_redelivered_total`. A steady rise in the counter means workers
+  are dying or failing to write while the queue itself looks healthy.
+- CI runs the Redis tests against a real Redis instead of skipping them.
 
 - Queue depth is sampled by a background poller, in every process that can
   reach the queue rather than only in a worker: a deployment whose workers have
