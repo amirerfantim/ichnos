@@ -7,7 +7,7 @@
 
 use axum_test::TestServer;
 use ichnos::api::auth::KeyCache;
-use ichnos::api::handlers::{router, AppState};
+use ichnos::api::handlers::{router, worker_router, AppState};
 use ichnos::api::quota::MemoryQuota;
 use ichnos::config::Config;
 use ichnos::ingest::queue::MemoryQueue;
@@ -476,4 +476,19 @@ async fn a_key_without_a_quota_is_never_refused() {
     for _ in 0..50 {
         assert_eq!(h.locate(json!({})).await.0, 404, "no allowance means no ceiling");
     }
+}
+
+#[tokio::test]
+async fn a_worker_serves_its_metrics_and_nothing_else() {
+    // A worker answers no requests, but what it measures lives in its own
+    // process, so without this route no scrape would ever see it.
+    let server = TestServer::new(worker_router()).unwrap();
+
+    let metrics = server.get("/metrics").await;
+    assert_eq!(metrics.status_code().as_u16(), 200);
+    assert!(metrics.text().contains("ichnos_leases_held"));
+
+    assert_eq!(server.get("/health").await.status_code().as_u16(), 200);
+    let locate = server.post("/v1/locate").json(&json!({})).await;
+    assert_eq!(locate.status_code().as_u16(), 404, "a worker answers no requests");
 }
