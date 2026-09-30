@@ -104,6 +104,12 @@ spec:
   template:
     metadata:
       labels: {app: ichnos, component: worker}
+      # The worker serves /metrics too: leases, folding and write errors are
+      # measured here, not in the API pods.
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+        prometheus.io/path: "/metrics"
     spec:
       # Long enough for a worker to finish its batch and hand its shards back,
       # so a restart is picked up in seconds rather than when leases expire.
@@ -112,6 +118,11 @@ spec:
         - name: ichnos
           image: IMAGE_REF
           args: ["worker", "--config", "/etc/ichnos/config.toml"]
+          ports: [{containerPort: 8080, name: metrics}]
+          livenessProbe:
+            httpGet: {path: /health, port: 8080}
+            initialDelaySeconds: 5
+            periodSeconds: 15
           env:
             - name: ICHNOS_LOG
               value: info
