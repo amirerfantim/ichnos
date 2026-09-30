@@ -4,6 +4,15 @@
 
 ### Fixed
 
+- **The same locate request could get a different answer each time.** The
+  stations of a request were kept in a hash map, whose order is random per
+  request, and summed in that order, so positions, accuracies and scores
+  moved in their last bits between identical requests, and `explain.used`
+  came out in a random order. They are now taken in the order the client
+  named them, whatever order the store answers in.
+- **`explain` could mark two clusters chosen.** A candidate was marked when
+  it sat at the winner's position, so a WiFi cluster and a cell on the same
+  point were both marked. Now only the winner is.
 - **The API key cache could grow without end.** An entry was dropped only
   when its own key was asked for again, so a flood of made-up keys, each
   asked once, stayed in memory for ever. Past 10,000 entries, expired ones
