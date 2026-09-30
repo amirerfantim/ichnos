@@ -267,7 +267,7 @@ and **quality** says whether the answers are getting better or worse.
 | Metric | Why |
 |---|---|
 | `ichnos_stream_fill_ratio` | The fullest shard against its cap. Rises before anything breaks. Depth alone means nothing without the cap it is measured against. |
-| `ichnos_stream_trimmed_total` | Data loss. Should be flat at zero. |
+| `ichnos_stream_trimmed_total` | Data loss: entries the cap dropped before they were done. Should be flat at zero. |
 | `ichnos_locate_coverage` | Share of asked-about networks the service knew. Falls long before any error appears. |
 | `ichnos_degraded` | The read path is answering from cache alone. |
 

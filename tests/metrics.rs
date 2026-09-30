@@ -332,7 +332,7 @@ async fn trimmed_entries_are_reported_as_a_step_not_as_a_total() {
     // Five into a shard that holds two: three are trimmed.
     let entries: Vec<_> = (0..5).map(observation).collect();
     queue.publish(&entries).await.unwrap();
-    assert_eq!(queue.trimmed(), 3);
+    assert_eq!(queue.trimmed().await.unwrap(), 3);
 
     let before = {
         let text = ichnos::metrics::metrics().render();
