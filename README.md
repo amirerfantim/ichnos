@@ -5,10 +5,12 @@ it can see, and learns where those stations are from devices that already know
 their own position.
 
 It is a ground-up reimplementation of [Mozilla Ichnaea][ichnaea]'s positioning
-algorithm in Rust. The maths is deliberately unchanged, so answers can be
-compared against the original directly. What differs is everything around the
-maths, which is built for a very different traffic shape: many devices reporting
-the same stations, over and over, all day.
+algorithm in Rust, built to replace Ichnaea outright rather than to run beside
+it. The maths is Ichnaea's, so a client gets the answers Ichnaea would give;
+the few places it deliberately differs are listed under
+[Development](#development). What differs is everything around the maths,
+which is built for a very different traffic shape: many devices reporting the
+same stations, over and over, all day.
 
 The request and response bodies are Ichnaea's, so a client only has to change
 which URL it posts to. The routes themselves are not: upstream's `/v2/geosubmit`
@@ -363,8 +365,8 @@ cargo clippy --all-targets
 cargo run -- serve --in-memory --with-worker
 ```
 
-The maths is checked against the original rather than against a description of
-it. `docs/reference/` holds the generators: one transcribes Ichnaea's geodesy
+The maths was checked against the original rather than against a description
+of it; nothing at run time depends on Ichnaea. `docs/reference/` holds the generators: one transcribes Ichnaea's geodesy
 into Python, the other runs the real `scipy` over Ichnaea's own objective
 function and clustering. The golden values in the tests come from those, and can
 be regenerated.
@@ -375,11 +377,14 @@ happen:
 1. **Cluster trimming.** When a cluster exceeds the size cap, Ichnaea sorts
    ascending and keeps the head, which keeps the *least* trustworthy members and
    contradicts its own comment. Ichnos keeps the best.
-2. **Fit convergence.** On clusters with a large scale mismatch, MINPACK's
-   relative-step test stops early, in one measured case 67% above the minimum.
-   Ichnos runs to convergence. A test asserts our objective value is never the
-   worse of the two, and on every cluster shape the clusterer can actually
-   produce the two agree to within seven centimetres.
+2. **The fit reaches the minimum.** Ichnaea finds the position by searching
+   with MINPACK, which stops short on a flat objective: two or three stations,
+   or a line of them. Over 2,607 random clusters it ended more than a metre from
+   the minimum 83 times, up to 201 m. Ichnos minimises the same objective, but
+   computes the minimum directly: it is a weighted average with the squared
+   residual weights, within 6 mm of the exact minimum at cluster scale. Where
+   MINPACK does reach the minimum, the two agree to a few centimetres, and a
+   test asserts the objective value is never worse than MINPACK's.
 
 ### Layout
 
