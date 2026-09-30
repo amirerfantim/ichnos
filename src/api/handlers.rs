@@ -268,7 +268,7 @@ async fn locate(
     let candidates = locate::candidates(wifi_networks.clone(), cell_networks.clone(), &state.cfg);
     m.locate_candidates.observe(candidates.len() as f64);
 
-    let Some(answer) = locate::best(&candidates) else {
+    let Some(chosen) = locate::best_index(&candidates) else {
         m.locate_results.with_label_values(&["none"]).inc();
         // Knowing none of the stations is a coverage problem; knowing some but
         // finding no cluster among them is an algorithm or a spoofing problem.
@@ -277,6 +277,7 @@ async fn locate(
         m.locate_no_answer.with_label_values(&[reason]).inc();
         return finish("locate", started, not_found());
     };
+    let answer = &candidates[chosen];
 
     let source = match answer.source {
         PositionSource::Wifi => "wifi",
@@ -287,11 +288,11 @@ async fn locate(
     m.locate_cluster_size.with_label_values(&[source]).observe(answer.used.len() as f64);
     m.locate_score.with_label_values(&[source]).observe(answer.score);
     m.locate_stale_networks.inc_by(answer.used.iter().filter(|u| !u.seen_today).count() as u64);
-    record_disagreement(&candidates, &answer);
+    record_disagreement(&candidates, answer);
 
     let explain = query
         .wants_explain()
-        .then(|| build_explain(&lookup, &wifi_networks, &cell_networks, &candidates, &answer));
+        .then(|| build_explain(&lookup, &wifi_networks, &cell_networks, &candidates, chosen));
 
     let response = LocateResponse {
         location: LatLng { lat: answer.lat, lng: answer.lon },
@@ -301,25 +302,35 @@ async fn locate(
     finish("locate", started, (StatusCode::OK, Json(response)).into_response())
 }
 
-/// The stations a request asked about, with what the client reported of each.
+/// The stations a request asked about, with what the client reported of each,
+/// in the order the client first named them. The order is kept so that the
+/// same request always gives the same answer, to the last bit: the stations
+/// are summed in this order, and a hash map's order is random per map.
 struct RequestNetworks {
     wifi: HashMap<WifiKey, (Option<i32>, Option<f64>)>,
+    wifi_order: Vec<WifiKey>,
     cells: HashMap<CellKey, (Option<i32>, Option<f64>)>,
+    cell_order: Vec<CellKey>,
 }
 
 impl RequestNetworks {
     fn from_request(request: &LocateRequest, cfg: &Config) -> Self {
         let mut wifi = HashMap::new();
+        let mut wifi_order = Vec::new();
         for ap in request.wifi_access_points.iter().take(cfg.api.max_networks) {
             if let Some(mac) = ap.mac_address.as_deref() {
                 if let Ok(key) = WifiKey::parse(&mac.to_ascii_lowercase()) {
                     let signal = ap.signal_strength.filter(|s| *s != 0).map(|s| s as i32);
-                    wifi.insert(key, (signal, ap.age));
+                    // A repeat keeps its first place and its last report.
+                    if wifi.insert(key, (signal, ap.age)).is_none() {
+                        wifi_order.push(key);
+                    }
                 }
             }
         }
 
         let mut cells = HashMap::new();
+        let mut cell_order = Vec::new();
         for tower in request.cell_towers.iter().take(cfg.api.max_networks) {
             let Some(radio) = tower.radio_type.as_deref().and_then(Radio::parse) else {
                 continue;
@@ -334,10 +345,12 @@ impl RequestNetworks {
             };
             let key = CellKey { radio, mcc: mcc as i32, mnc: mnc as i32, lac, cid };
             let signal = tower.signal_strength.filter(|s| *s != 0).map(|s| s as i32);
-            cells.insert(key, (signal, tower.age));
+            if cells.insert(key, (signal, tower.age)).is_none() {
+                cell_order.push(key);
+            }
         }
 
-        Self { wifi, cells }
+        Self { wifi, wifi_order, cells, cell_order }
     }
 
     fn is_empty(&self) -> bool {
@@ -345,10 +358,10 @@ impl RequestNetworks {
     }
 
     fn keys(&self) -> Vec<StationKey> {
-        self.wifi
-            .keys()
+        self.wifi_order
+            .iter()
             .map(|k| StationKey::Wifi(*k))
-            .chain(self.cells.keys().map(|k| StationKey::Cell(*k)))
+            .chain(self.cell_order.iter().map(|k| StationKey::Cell(*k)))
             .collect()
     }
 
@@ -363,7 +376,10 @@ impl RequestNetworks {
         let mut wifi = Vec::new();
         let mut cells = Vec::new();
 
-        for station in stations {
+        // In the order the client named them, not the order the store
+        // answered in, which a store reading in parallel does not fix.
+        let by_key: HashMap<StationKey, &Station> = stations.iter().map(|s| (s.key, s)).collect();
+        for station in self.keys().iter().filter_map(|k| by_key.get(k).copied()) {
             // A station with no position has nothing to contribute, and a
             // blocked one is untrusted on purpose.
             if !station.has_position() || station.is_blocked(today, &cfg.block) {
@@ -409,11 +425,13 @@ fn build_explain(
     wifi: &[Network],
     cells: &[Network],
     candidates: &[locate::Position],
-    answer: &locate::Position,
+    chosen: usize,
 ) -> Explain {
+    let answer = &candidates[chosen];
     let clusters = candidates
         .iter()
-        .map(|c| ExplainCluster {
+        .enumerate()
+        .map(|(i, c)| ExplainCluster {
             source: match c.source {
                 PositionSource::Wifi => "wifi".into(),
                 PositionSource::Cell => "cell".into(),
@@ -421,7 +439,9 @@ fn build_explain(
             size: c.used.len(),
             score: c.score,
             accuracy: c.accuracy,
-            chosen: (c.lat, c.lon) == (answer.lat, answer.lon),
+            // The winner itself, not whatever shares its position: two
+            // candidates can sit on the same point.
+            chosen: i == chosen,
         })
         .collect();
 
