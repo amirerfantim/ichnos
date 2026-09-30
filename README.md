@@ -253,7 +253,9 @@ ichnos show-config
 
 `serve` and `worker` are separate processes so the read path and the write path
 can be scaled apart, and so a busy worker cannot slow down an answer. For
-development, `serve --with-worker` runs both.
+development, `serve --with-worker` runs both. A worker answers no requests, but
+serves `/health` and `/metrics` on `server.bind`, since what it measures lives
+in its own process.
 
 ### Metrics
 
