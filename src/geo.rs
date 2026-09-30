@@ -1,10 +1,10 @@
 //! Geodesic maths, ported line for line from Ichnaea's `geocalclib/geocalc.pyx`.
 //!
-//! Fidelity matters more than elegance here: every position Ichnos computes is
-//! compared against Ichnaea's output, so any difference in the distance function
-//! shows up as a difference in the answer. `distance` is therefore Vincenty with
-//! a Haversine fallback, exactly as upstream, and not the more obvious plain
-//! Haversine.
+//! Fidelity matters more than elegance here: every clustering decision and
+//! every station radius is a distance, so a different distance function would
+//! give different answers from the algorithm Ichnos replaces. `distance` is
+//! therefore Vincenty with a Haversine fallback, exactly as upstream, and not
+//! the more obvious plain Haversine.
 
 /// Earth radius in km, used by the Haversine formula.
 const EARTH_RADIUS: f64 = 6371.009;

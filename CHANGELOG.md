@@ -4,6 +4,20 @@
 
 ### Fixed
 
+- **The WiFi position fit often stopped before the minimum.** It searched with
+  fifty steps of Levenberg-Marquardt, and on a flat objective (two or three
+  stations, or a line of them) it crawled: over 2,607 random clusters it ended
+  more than a metre from the minimum 365 times, up to 209 m, and more often
+  than Ichnaea's MINPACK (83 times). Where it stopped depended on the last bit
+  of the distance function, so the same request gave answers up to 19 m apart
+  on arm64 and on amd64. The objective is a weighted sum of squared
+  distances, whose minimum is a weighted average, so it is now computed
+  directly: within 6 mm of the exact minimum, never worse than MINPACK, and
+  the same on every processor. `colinear_five` joins `weighted_pair` as a
+  reference case where MINPACK stops short (55% above the minimum).
+- Documentation implied answers would be compared with Ichnaea in production.
+  Ichnos replaces Ichnaea; nothing at run time depends on it.
+
 - **A batch that was taken and never acknowledged stayed pending for ever.**
   The documentation said a dead worker's batch is redelivered. It was not: the
   Redis queue only ever read entries never delivered to anyone
