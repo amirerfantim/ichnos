@@ -12,15 +12,16 @@ use crate::metrics::{metrics, Timer};
 use crate::model::key::{CellKey, Radio, StationKind, WifiKey};
 use crate::model::{Observation, Station, StationKey};
 use crate::store::Store;
-use axum::extract::{Path, Query, State};
+use axum::extract::{DefaultBodyLimit, Path, Query, Request, State};
 use axum::http::StatusCode;
+use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use chrono::Utc;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// Everything a handler needs.
 #[derive(Clone)]
@@ -48,12 +49,20 @@ impl CommonQuery {
 }
 
 pub fn router(state: AppState) -> Router {
+    let timeout = Duration::from_millis(state.cfg.server.request_timeout_ms);
     Router::new()
         // A noun for the collection you write to, a verb for the question you
         // ask. Posting observations creates records; locating computes an
         // answer and stores nothing.
         .route("/v1/observations", post(observations))
         .route("/v1/locate", post(locate))
+        // Only the client routes are bounded: they are the ones a slow
+        // dependency can hold up, and the operator routes must keep answering
+        // exactly when things are slow.
+        .route_layer(middleware::from_fn_with_state(timeout, request_timeout))
+        // A body over the limit fails to parse, and is answered as any
+        // unreadable body is.
+        .layer(DefaultBodyLimit::max(state.cfg.api.max_body_bytes))
         .route("/debug/station/{kind}/{key}", get(debug_station))
         .route("/health", get(health))
         .route("/ready", get(ready))
@@ -498,6 +507,32 @@ async fn debug_station(
             tracing::warn!(error = %e, "debug lookup failed");
             (StatusCode::SERVICE_UNAVAILABLE, Json(ErrorResponse::invalid("Storage unavailable")))
                 .into_response()
+        }
+    }
+}
+
+/// Answer a client request that runs past `server.request_timeout_ms` with a
+/// 503, rather than holding the client for as long as a slow dependency does.
+/// A locate that cannot answer quickly is worth less than a fast "no".
+async fn request_timeout(State(limit): State<Duration>, request: Request, next: Next) -> Response {
+    let started = Instant::now();
+    let route = match request.uri().path() {
+        "/v1/locate" => "locate",
+        _ => "observations",
+    };
+    match tokio::time::timeout(limit, next.run(request)).await {
+        Ok(response) => response,
+        Err(_) => {
+            tracing::warn!(route, limit_ms = limit.as_millis() as u64, "request timed out");
+            finish(
+                route,
+                started,
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(ErrorResponse::invalid("Request timed out")),
+                )
+                    .into_response(),
+            )
         }
     }
 }

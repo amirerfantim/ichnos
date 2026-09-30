@@ -4,6 +4,13 @@
 
 ### Fixed
 
+- **`server.request_timeout_ms` and `api.max_body_bytes` did nothing.** No
+  request was ever timed out, and bodies up to axum's 2 MiB default were read
+  whatever the setting said. A client request (`/v1/observations`,
+  `/v1/locate`) that runs past the timeout is now answered with a 503 and the
+  usual error body, "Request timed out"; the operator routes are not bounded.
+  A body over the limit is answered as any unreadable body is: 400, "Invalid
+  request body".
 - **A worker's metrics were never scraped.** `ichnos worker` opened no port,
   so everything measured on the write path (leases held and lost, fold
   ratio, elision, write and lease errors, queue lag) existed only in the

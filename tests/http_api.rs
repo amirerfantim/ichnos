@@ -492,3 +492,122 @@ async fn a_worker_serves_its_metrics_and_nothing_else() {
     let locate = server.post("/v1/locate").json(&json!({})).await;
     assert_eq!(locate.status_code().as_u16(), 404, "a worker answers no requests");
 }
+
+/// A store that answers, but only after a pause.
+struct SlowStore {
+    inner: MemoryStore,
+    pause: std::time::Duration,
+}
+
+#[async_trait::async_trait]
+impl Store for SlowStore {
+    async fn get_stations(
+        &self,
+        keys: &[ichnos::model::StationKey],
+    ) -> ichnos::store::Result<Vec<ichnos::model::Station>> {
+        tokio::time::sleep(self.pause).await;
+        self.inner.get_stations(keys).await
+    }
+    async fn put_stations(&self, stations: &[ichnos::model::Station]) -> ichnos::store::Result<()> {
+        self.inner.put_stations(stations).await
+    }
+    async fn delete_station(&self, key: &ichnos::model::StationKey) -> ichnos::store::Result<()> {
+        self.inner.delete_station(key).await
+    }
+    async fn stations_near(
+        &self,
+        h3: i64,
+        kind: ichnos::model::key::StationKind,
+    ) -> ichnos::store::Result<Vec<ichnos::model::StationKey>> {
+        self.inner.stations_near(h3, kind).await
+    }
+    async fn get_api_key(&self, key: &str) -> ichnos::store::Result<Option<ApiKey>> {
+        self.inner.get_api_key(key).await
+    }
+    async fn put_api_key(&self, api_key: &ApiKey) -> ichnos::store::Result<()> {
+        self.inner.put_api_key(api_key).await
+    }
+    async fn health(&self) -> ichnos::store::Result<()> {
+        self.inner.health().await
+    }
+}
+
+fn server_with(cfg: Config, store: Arc<dyn Store>) -> TestServer {
+    let state = AppState {
+        store,
+        queue: Arc::new(MemoryQueue::new(cfg.ingest.shards, 1_000)),
+        cfg: Arc::new(cfg.clone()),
+        keys: Arc::new(KeyCache::new(&cfg.api)),
+        quota: Arc::new(MemoryQuota::new()),
+    };
+    TestServer::new(router(state)).unwrap()
+}
+
+#[tokio::test]
+async fn a_request_slower_than_the_timeout_is_answered_with_a_503() {
+    // A locate that cannot answer quickly is worth less than a fast "no".
+    let mut cfg = Config::for_tests();
+    cfg.server.request_timeout_ms = 50;
+    let inner = MemoryStore::new();
+    inner.put_api_key(&ApiKey::full("test-key")).await.unwrap();
+    let pause = std::time::Duration::from_millis(500);
+    let server = server_with(cfg, Arc::new(SlowStore { inner, pause }));
+
+    let started = std::time::Instant::now();
+    let response = server
+        .post("/v1/locate")
+        .add_query_param("key", "test-key")
+        .json(&ask(&[("aabbccddeeff", -60), ("aabbccddee00", -70)]))
+        .await;
+    assert!(started.elapsed() < pause, "the client was held for the whole pause");
+    assert_eq!(response.status_code().as_u16(), 503);
+    let body = response.json::<Value>();
+    assert_eq!(body["error"]["message"], "Request timed out");
+
+    // The operator routes are not bounded, and still answer.
+    assert_eq!(server.get("/health").await.status_code().as_u16(), 200);
+}
+
+#[tokio::test]
+async fn a_request_inside_the_timeout_is_answered_normally() {
+    let mut cfg = Config::for_tests();
+    cfg.server.request_timeout_ms = 2_000;
+    let inner = MemoryStore::new();
+    inner.put_api_key(&ApiKey::full("test-key")).await.unwrap();
+    let pause = std::time::Duration::from_millis(20);
+    let server = server_with(cfg, Arc::new(SlowStore { inner, pause }));
+    let response = server
+        .post("/v1/locate")
+        .add_query_param("key", "test-key")
+        .json(&ask(&[("aabbccddeeff", -60)]))
+        .await;
+    assert_eq!(response.status_code().as_u16(), 404, "no answer, but not a timeout");
+}
+
+#[tokio::test]
+async fn a_body_over_the_limit_is_refused_as_an_unreadable_one() {
+    let mut cfg = Config::for_tests();
+    cfg.api.max_body_bytes = 256;
+    let inner = MemoryStore::new();
+    inner.put_api_key(&ApiKey::full("test-key")).await.unwrap();
+    let server = server_with(cfg, Arc::new(inner));
+
+    let small = report(35.7, 51.3, &[("aabbccddeeff", -60)]);
+    let status = |r: axum_test::TestResponse| r.status_code().as_u16();
+    assert_eq!(
+        status(
+            server.post("/v1/observations").add_query_param("key", "test-key").json(&small).await
+        ),
+        200
+    );
+
+    let many: Vec<(String, i64)> = (0..20).map(|i| (format!("aabbccdd{i:04x}"), -60)).collect();
+    let macs: Vec<(&str, i64)> = many.iter().map(|(m, s)| (m.as_str(), *s)).collect();
+    let big = report(35.7, 51.3, &macs);
+    assert!(big.to_string().len() > 256);
+    for route in ["/v1/observations", "/v1/locate"] {
+        let response = server.post(route).add_query_param("key", "test-key").json(&big).await;
+        assert_eq!(response.status_code().as_u16(), 400, "{route}");
+        assert_eq!(response.json::<Value>()["error"]["message"], "Invalid request body");
+    }
+}
