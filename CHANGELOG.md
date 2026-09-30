@@ -4,6 +4,11 @@
 
 ### Fixed
 
+- **The API key cache could grow without end.** An entry was dropped only
+  when its own key was asked for again, so a flood of made-up keys, each
+  asked once, stayed in memory for ever. Past 10,000 entries, expired ones
+  are now swept on insert, which bounds the cache by what arrives within
+  `api.key_cache_secs`.
 - **`server.request_timeout_ms` and `api.max_body_bytes` did nothing.** No
   request was ever timed out, and bodies up to axum's 2 MiB default were read
   whatever the setting said. A client request (`/v1/observations`,
