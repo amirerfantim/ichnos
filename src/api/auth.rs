@@ -64,6 +64,9 @@ pub enum Permission {
     Admin,
 }
 
+/// Cache size past which expired entries are swept on each insert.
+const SWEEP_ABOVE: usize = 10_000;
+
 /// A short-lived in-process cache of API keys.
 pub struct KeyCache {
     entries: Mutex<HashMap<String, (Option<ApiKey>, Instant)>>,
@@ -145,10 +148,25 @@ impl KeyCache {
     }
 
     fn remember(&self, key: &str, value: Option<ApiKey>) {
-        self.entries
-            .lock()
-            .expect("key cache poisoned")
-            .insert(key.to_string(), (value, Instant::now() + self.ttl));
+        let now = Instant::now();
+        let mut entries = self.entries.lock().expect("key cache poisoned");
+        // An entry is otherwise dropped only when its own key is asked for
+        // again, so a flood of made-up keys, each asked once, would grow the
+        // cache without end. Past a size, expired entries are swept, which
+        // bounds the cache by what arrives within one lifetime.
+        if entries.len() >= SWEEP_ABOVE {
+            entries.retain(|_, (_, until)| *until > now);
+        }
+        entries.insert(key.to_string(), (value, now + self.ttl));
+    }
+
+    /// How many keys are cached, expired or not.
+    pub fn len(&self) -> usize {
+        self.entries.lock().expect("key cache poisoned").len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 
     /// Forget a key at once, for tests and for an administrative revoke.
@@ -323,6 +341,28 @@ mod tests {
         let cfg = ApiCfg { require_keys: false, ..ApiCfg::default() };
         let cache = KeyCache::new(&cfg);
         assert!(cache.check(&store, None, Permission::Admin).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_flood_of_made_up_keys_does_not_grow_the_cache_for_ever() {
+        let store = MemoryStore::new();
+        let cache = KeyCache::new(&ApiCfg { key_cache_secs: 0, ..cfg() });
+        for i in 0..SWEEP_ABOVE + 500 {
+            let _ = cache.check(&store, Some(&format!("bogus-{i}")), Permission::Locate).await;
+        }
+        // With a lifetime of zero every entry has expired by the next insert,
+        // so each sweep leaves one.
+        assert!(cache.len() <= SWEEP_ABOVE, "{} entries", cache.len());
+    }
+
+    #[tokio::test]
+    async fn live_entries_survive_a_sweep() {
+        let store = store_with(ApiKey::full("busy")).await;
+        let cache = KeyCache::new(&cfg());
+        for i in 0..SWEEP_ABOVE + 10 {
+            let _ = cache.check(&store, Some(&format!("bogus-{i}")), Permission::Locate).await;
+        }
+        assert_eq!(cache.len(), SWEEP_ABOVE + 10, "nothing had expired, so nothing went");
     }
 
     #[tokio::test]
