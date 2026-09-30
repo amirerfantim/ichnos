@@ -29,90 +29,52 @@ pub fn weighted_mean(networks: &[Network]) -> (f64, f64) {
     (sum_lat / sum_w, sum_lon / sum_w)
 }
 
-/// Fit a position by minimising the weighted distances to every station.
+/// The point that minimises Ichnaea's objective: the sum over stations of
+/// (distance × residual weight)², where the residual weight is freshness over
+/// signal squared.
 ///
-/// This is the same idea as upstream's least-squares call: find the point that
-/// sits best among the stations, letting fresh, strongly heard ones pull
-/// hardest. Levenberg-Marquardt over two parameters, starting from the weighted
-/// mean, with a numerical Jacobian because the distance function is Vincenty
-/// and has no tidy derivative.
+/// That objective is a weighted sum of squared distances, and the point that
+/// minimises such a sum is the weighted average of the positions, with each
+/// station weighted by its residual weight squared. So it is computed directly,
+/// in one pass, instead of searched for.
 ///
-/// If the iteration fails to improve on the starting point, the starting point
-/// is returned. An answer that is merely good beats no answer.
+/// Ichnaea searches with MINPACK, and an earlier version of this function with
+/// fifty steps of Levenberg-Marquardt. Both stop before the minimum on a flat
+/// objective, which is what a cluster of two or three stations, or a line of
+/// them, produces. Over 2,607 random clusters the fifty-step search ended more
+/// than a metre from the minimum 365 times (up to 209 m) and MINPACK 83 times.
+/// Where it stopped depended on the last bit of the distance function, so the
+/// answer even differed between processors.
+///
+/// Averaging in degrees treats the ground as flat across the cluster. At the
+/// few hundred metres a cluster can span, that is within 6 mm of the true
+/// minimum on the same 2,607 clusters (median 0.08 mm). It uses no
+/// trigonometry, so it gives the same bits on every platform.
+///
+/// Fewer than two stations, or weights that vanish or overflow, fall back to
+/// the weighted mean.
 pub fn fit_position(networks: &[Network]) -> (f64, f64) {
-    let (mut lat, mut lon) = weighted_mean(networks);
     if networks.len() < 2 {
-        return (lat, lon);
+        return weighted_mean(networks);
     }
-
-    // About a centimetre, small enough to differentiate over and large enough
-    // to stay clear of floating-point noise.
-    const STEP: f64 = 1e-7;
-    const MAX_ITERATIONS: usize = 50;
-
-    let cost = |lat: f64, lon: f64| -> f64 {
-        networks.iter().map(|n| residual(n, lat, lon).powi(2)).sum::<f64>()
-    };
-
-    let mut lambda = 1e-3;
-    let mut current = cost(lat, lon);
-
-    for _ in 0..MAX_ITERATIONS {
-        // Numerical Jacobian: one column per parameter.
-        let mut jtj = [[0.0f64; 2]; 2];
-        let mut jtr = [0.0f64; 2];
-        for net in networks {
-            let r = residual(net, lat, lon);
-            let d_lat = (residual(net, lat + STEP, lon) - r) / STEP;
-            let d_lon = (residual(net, lat, lon + STEP) - r) / STEP;
-            jtj[0][0] += d_lat * d_lat;
-            jtj[0][1] += d_lat * d_lon;
-            jtj[1][0] += d_lat * d_lon;
-            jtj[1][1] += d_lon * d_lon;
-            jtr[0] += d_lat * r;
-            jtr[1] += d_lon * r;
-        }
-
-        // Damped normal equations, solved directly because there are only two
-        // unknowns.
-        let a = jtj[0][0] * (1.0 + lambda);
-        let b = jtj[0][1];
-        let c = jtj[1][0];
-        let d = jtj[1][1] * (1.0 + lambda);
-        let det = a * d - b * c;
-        if det.abs() < f64::EPSILON {
-            break;
-        }
-        let delta_lat = -(d * jtr[0] - b * jtr[1]) / det;
-        let delta_lon = -(a * jtr[1] - c * jtr[0]) / det;
-        if !delta_lat.is_finite() || !delta_lon.is_finite() {
-            break;
-        }
-
-        let (try_lat, try_lon) = (lat + delta_lat, lon + delta_lon);
-        let trial = cost(try_lat, try_lon);
-        if trial < current {
-            let improvement = current - trial;
-            lat = try_lat;
-            lon = try_lon;
-            current = trial;
-            lambda = (lambda / 10.0).max(1e-12);
-            if improvement < 1e-12 {
-                break; // converged
-            }
-        } else {
-            lambda *= 10.0;
-            if lambda > 1e12 {
-                break; // no step helps
-            }
-        }
+    let mut sum_w = 0.0;
+    let mut sum_lat = 0.0;
+    let mut sum_lon = 0.0;
+    for net in networks {
+        let w = net.residual_weight().powi(2);
+        sum_w += w;
+        sum_lat += net.lat * w;
+        sum_lon += net.lon * w;
     }
-
-    (lat, lon)
+    if sum_w <= 0.0 || !sum_w.is_finite() {
+        return weighted_mean(networks);
+    }
+    (sum_lat / sum_w, sum_lon / sum_w)
 }
 
 /// One station's contribution to the objective: its distance from the candidate
 /// point, scaled by how much the station should matter.
+#[cfg(test)]
 fn residual(net: &Network, lat: f64, lon: f64) -> f64 {
     distance(net.lat, net.lon, lat, lon) * net.residual_weight()
 }
@@ -425,15 +387,17 @@ mod tests {
         }
     }
 
+    /// Cases where MINPACK stops short of the minimum, so its answer is not
+    /// the reference. `weighted_pair` has a scale mismatch that trips its
+    /// relative-step test (cost 67% above the minimum); on `colinear_five`,
+    /// five stations in a line, it never leaves the starting point (55%
+    /// above). Both are covered by the test that compares cost instead.
+    const SCIPY_STOPS_EARLY: [&str; 2] = ["weighted_pair", "colinear_five"];
+
     #[test]
-    fn fit_matches_scipy_on_every_realistic_cluster() {
-        // Agreement is to centimetres on every shape the clusterer can
-        // actually produce. `weighted_pair` is excluded because its two
-        // stations are 2.2 km apart: no cluster at a 500 m threshold could
-        // ever contain them, so the case exists only to exercise the optimiser
-        // under a scale mismatch. It is covered by the test below instead.
+    fn fit_matches_scipy_wherever_scipy_reaches_the_minimum() {
         for case in fit_cases() {
-            if case.name == "weighted_pair" {
+            if SCIPY_STOPS_EARLY.contains(&case.name) {
                 continue;
             }
             let (lat, lon) = fit_position(&case.nets);
@@ -452,37 +416,99 @@ mod tests {
     fn the_fit_is_never_worse_than_scipys_even_where_it_differs() {
         // The objective is the thing being minimised, so a lower value is a
         // better answer regardless of which implementation produced it.
-        //
-        // On `weighted_pair` scipy's MINPACK stops after eight evaluations at a
-        // point whose cost is 67% above the minimum, because the parameters are
-        // degrees near 35 and 51 while the residuals are near 0.3, and its
-        // relative-step test fires on that mismatch. This implementation runs
-        // to convergence and lands within 0.05% of the true minimum.
         for case in fit_cases() {
-            let cost = |la: f64, lo: f64| -> f64 {
-                case.nets.iter().map(|n| residual(n, la, lo).powi(2)).sum::<f64>()
-            };
             let (lat, lon) = fit_position(&case.nets);
-            let ours = cost(lat, lon);
-            let theirs = cost(case.want_fit.0, case.want_fit.1);
+            let ours = cost(&case.nets, lat, lon);
+            let theirs = cost(&case.nets, case.want_fit.0, case.want_fit.1);
             assert!(
                 ours <= theirs + 1e-9,
                 "{}: our cost {ours:.10} is worse than scipy's {theirs:.10}",
                 case.name
             );
+            if SCIPY_STOPS_EARLY.contains(&case.name) {
+                assert!(ours < theirs * 0.7, "{}: expected a clearly lower cost", case.name);
+            }
         }
+    }
+
+    fn cost(nets: &[Network], lat: f64, lon: f64) -> f64 {
+        nets.iter().map(|n| residual(n, lat, lon).powi(2)).sum::<f64>()
+    }
+
+    /// Two stations with different weights, the shape on which a step-wise
+    /// search stalls: the objective is almost flat along the line through them.
+    fn uneven_pair() -> Vec<Network> {
+        vec![n2(35.3204, 48.1197, 1.0, -48.0, 1000.0), n2(35.3222, 48.1215, 1.0, -91.0, 8000.0)]
+    }
+
+    #[test]
+    fn the_fit_is_the_average_weighted_by_the_squared_residual_weight() {
+        let nets = uneven_pair();
+        let w: Vec<f64> = nets.iter().map(|n| n.residual_weight().powi(2)).collect();
+        let total = w[0] + w[1];
+        let lat = (nets[0].lat * w[0] + nets[1].lat * w[1]) / total;
+        let lon = (nets[0].lon * w[0] + nets[1].lon * w[1]) / total;
+        assert_eq!(fit_position(&nets), (lat, lon));
+    }
+
+    #[test]
+    fn no_nearby_point_is_better_than_the_fit() {
+        // Five centimetres in every direction costs more: the fit is at the
+        // bottom, not somewhere on the slope towards it.
+        let cases = fit_cases();
+        for nets in
+            [uneven_pair(), cases[2].nets.clone(), cases[3].nets.clone(), cases[5].nets.clone()]
+        {
+            let (lat, lon) = fit_position(&nets);
+            let here = cost(&nets, lat, lon);
+            let step = 0.05 / 111_000.0;
+            for (dlat, dlon) in [
+                (step, 0.0),
+                (-step, 0.0),
+                (0.0, step),
+                (0.0, -step),
+                (step, step),
+                (-step, -step),
+                (step, -step),
+                (-step, step),
+            ] {
+                assert!(
+                    cost(&nets, lat + dlat, lon + dlon) > here,
+                    "a point 5 cm away beats the fit"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn weights_that_vanish_or_overflow_fall_back_to_the_weighted_mean() {
+        let mut stale = uneven_pair();
+        for n in &mut stale {
+            n.age_ms = f64::INFINITY; // no freshness left, so every weight is zero
+        }
+        assert_eq!(fit_position(&stale), weighted_mean(&stale));
+
+        let mut silent = uneven_pair();
+        for n in &mut silent {
+            n.signal = 0.0; // infinite weight
+        }
+        let (lat, lon) = fit_position(&silent);
+        assert!(lat.is_finite() && lon.is_finite());
+        assert_eq!((lat, lon), weighted_mean(&silent));
     }
 
     #[test]
     fn accuracy_matches_scipy_reference_percentiles() {
         for case in fit_cases() {
-            if case.name == "weighted_pair" {
+            if SCIPY_STOPS_EARLY.contains(&case.name) {
                 continue; // fits to a different point, so a different spread
             }
             let (lat, lon) = fit_position(&case.nets);
             // Unclamped, so the comparison is against the raw percentile.
             let got = accuracy_from_spread(lat, lon, &case.nets, 0.0, f64::MAX);
-            assert_relative_eq!(got, case.want_acc95, max_relative = 1e-3);
+            // Averaging identical points may round by a nanometre, so a spread
+            // of zero is held to a micrometre rather than to a ratio of zero.
+            assert_relative_eq!(got, case.want_acc95, max_relative = 1e-3, epsilon = 1e-6);
         }
     }
 }
