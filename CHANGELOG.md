@@ -4,6 +4,17 @@
 
 ### Fixed
 
+- **Finished queue entries were never removed, so the queue metrics and the
+  cap were both wrong.** Acknowledging does not delete an entry from a Redis
+  stream, and nothing else did, so every stream filled to its cap and stayed
+  there: `ichnos_stream_depth` and `ichnos_stream_fill_ratio` counted finished
+  work and sat near full, the cap trimmed work that was already done, and 32
+  shards could hold millions of dead entries. And `ichnos_stream_trimmed_total`
+  was never incremented by the Redis queue at all. Acknowledging now also
+  deletes, in one script, and counts the deletions; what the cap trims is
+  what was added, less what is left, less what was deleted, which Redis 7
+  reports exactly. Depth now means entries not yet done, in memory as in
+  Redis. The queue Redis must be version 7 or later.
 - **The WiFi position fit often stopped before the minimum.** It searched with
   fifty steps of Levenberg-Marquardt, and on a flat objective (two or three
   stations, or a line of them) it crawled: over 2,607 random clusters it ended

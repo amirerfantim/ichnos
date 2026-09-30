@@ -325,8 +325,24 @@ async fn the_redis_queue_carries_observations_and_holds_them_until_acknowledged(
 async fn private_shard(url: &str, shard: u32) -> redis::aio::MultiplexedConnection {
     let client = redis::Client::open(url).unwrap();
     let mut conn = client.get_multiplexed_async_connection().await.unwrap();
-    let _: () = redis::cmd("DEL").arg(format!("obs:{shard}")).query_async(&mut conn).await.unwrap();
+    let _: () = redis::cmd("DEL")
+        .arg(format!("obs:{shard}"))
+        .arg(format!("obs:{shard}:acked"))
+        .query_async(&mut conn)
+        .await
+        .unwrap();
     conn
+}
+
+/// The same server with another database number. Trims are counted across
+/// every shard, so a test that counts them needs a database to itself.
+fn private_db(url: &str, db: u32) -> String {
+    let base = url.rsplit_once('/').map_or(url, |(base, _)| base);
+    format!("{base}/{db}")
+}
+
+async fn stream_len(conn: &mut redis::aio::MultiplexedConnection, shard: u32) -> u64 {
+    redis::cmd("XLEN").arg(format!("obs:{shard}")).query_async(conn).await.unwrap()
 }
 
 async fn pending_in_group(conn: &mut redis::aio::MultiplexedConnection, shard: u32) -> i64 {
@@ -487,4 +503,79 @@ async fn the_cached_store_reaches_the_real_database_once_and_then_stops() {
     assert_eq!(errors, 0);
 
     cached.delete_station(&key).await.unwrap();
+}
+
+#[tokio::test]
+async fn finished_work_leaves_the_stream() {
+    let Some(url) = redis_queue_url() else {
+        eprintln!("skipped: ICHNOS_TEST_REDIS_QUEUE is not set");
+        return;
+    };
+    let shard = 43;
+    let mut conn = private_shard(&url, shard).await;
+    let queue =
+        RedisQueue::connect(&url, 48, 1_000, "w".into(), Duration::from_secs(30)).await.unwrap();
+
+    let batch: Vec<(u32, Observation)> = (0..3).map(|_| (shard, test_observation())).collect();
+    queue.publish(&batch).await.unwrap();
+    assert_eq!(queue.depth(shard).await.unwrap(), 3);
+    let taken = queue.read(shard, 100).await.unwrap();
+    assert_eq!(queue.depth(shard).await.unwrap(), 3, "taken is not done");
+    let ids: Vec<String> = taken.iter().map(|e| e.id.clone()).collect();
+    queue.ack(shard, &ids).await.unwrap();
+
+    assert_eq!(stream_len(&mut conn, shard).await, 0, "acknowledged entries are deleted, not kept");
+    assert_eq!(queue.depth(shard).await.unwrap(), 0);
+    let acked: u64 =
+        redis::cmd("GET").arg(format!("obs:{shard}:acked")).query_async(&mut conn).await.unwrap();
+    assert_eq!(acked, 3);
+}
+
+#[tokio::test]
+async fn finished_work_is_never_counted_as_lost() {
+    // The defect this pins: without deleting finished entries every stream
+    // sat at its cap, and the cap trimmed work that was already done.
+    let Some(url) = redis_queue_url() else {
+        eprintln!("skipped: ICHNOS_TEST_REDIS_QUEUE is not set");
+        return;
+    };
+    let shard = 44;
+    let url = private_db(&url, 11);
+    let mut conn = private_shard(&url, shard).await;
+    let queue =
+        RedisQueue::connect(&url, 48, 10, "w".into(), Duration::from_secs(30)).await.unwrap();
+    for _ in 0..50 {
+        let batch: Vec<(u32, Observation)> = (0..10).map(|_| (shard, test_observation())).collect();
+        queue.publish(&batch).await.unwrap();
+        let taken = queue.read(shard, 100).await.unwrap();
+        let ids: Vec<String> = taken.iter().map(|e| e.id.clone()).collect();
+        queue.ack(shard, &ids).await.unwrap();
+    }
+    assert_eq!(stream_len(&mut conn, shard).await, 0);
+    assert_eq!(queue.trimmed().await.unwrap(), 0, "500 entries through a cap of 10, none lost");
+}
+
+#[tokio::test]
+async fn entries_dropped_unread_are_counted_exactly() {
+    let Some(url) = redis_queue_url() else {
+        eprintln!("skipped: ICHNOS_TEST_REDIS_QUEUE is not set");
+        return;
+    };
+    let shard = 45;
+    let url = private_db(&url, 12);
+    let mut conn = private_shard(&url, shard).await;
+    let queue =
+        RedisQueue::connect(&url, 48, 10, "w".into(), Duration::from_secs(30)).await.unwrap();
+    // MAXLEN ~ trims whole nodes, so the exact count is whatever left the
+    // stream: everything added less what is still there.
+    let batch: Vec<(u32, Observation)> = (0..1_000).map(|_| (shard, test_observation())).collect();
+    queue.publish(&batch).await.unwrap();
+    let left = stream_len(&mut conn, shard).await;
+    assert!(left < 1_000, "the cap trimmed nothing");
+    assert_eq!(queue.trimmed().await.unwrap(), 1_000 - left);
+
+    // A handle opened now does not report that loss again.
+    let later =
+        RedisQueue::connect(&url, 48, 10, "w".into(), Duration::from_secs(30)).await.unwrap();
+    assert_eq!(later.trimmed().await.unwrap(), 0);
 }

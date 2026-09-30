@@ -46,14 +46,16 @@ pub trait Queue: Send + Sync + 'static {
     /// leaves its work to be redelivered rather than losing it.
     async fn read(&self, shard: u32, max: usize) -> Result<Vec<Entry>>;
 
-    /// Mark entries as done. Unacknowledged entries come back.
+    /// Mark entries as done and remove them. Unacknowledged entries come back.
     async fn ack(&self, shard: u32, ids: &[String]) -> Result<()>;
 
-    /// How many entries are waiting in a shard.
+    /// How many entries in a shard are not yet done: waiting to be read, or
+    /// read and not yet acknowledged.
     async fn depth(&self, shard: u32) -> Result<usize>;
 
-    /// How many entries have been discarded by the cap since start-up.
-    fn trimmed(&self) -> u64;
+    /// How many entries the cap has discarded, across every shard, since this
+    /// handle was opened.
+    async fn trimmed(&self) -> Result<u64>;
 
     async fn healthy(&self) -> bool;
 }
@@ -109,10 +111,15 @@ pub async fn poll_depth<Q: Queue + ?Sized>(
                     m.stream_fill_ratio.set(fullest as f64 / maxlen as f64);
                 }
 
-                let trims = queue.trimmed();
-                if trims > reported_trims {
-                    m.stream_trimmed.inc_by(trims - reported_trims);
-                    reported_trims = trims;
+                match queue.trimmed().await {
+                    Ok(trims) if trims > reported_trims => {
+                        m.stream_trimmed.inc_by(trims - reported_trims);
+                        reported_trims = trims;
+                    }
+                    Ok(_) => {}
+                    Err(_) => {
+                        m.queue_errors.with_label_values(&["trimmed"]).inc();
+                    }
                 }
             }
         }
@@ -239,11 +246,13 @@ impl Queue for MemoryQueue {
 
     async fn depth(&self, shard: u32) -> Result<usize> {
         self.check()?;
-        Ok(self.shards.lock().expect("queue lock poisoned")[shard as usize].len())
+        let waiting = self.shards.lock().expect("queue lock poisoned")[shard as usize].len();
+        Ok(waiting + self.pending_count(shard))
     }
 
-    fn trimmed(&self) -> u64 {
-        self.trimmed.load(Ordering::Relaxed)
+    async fn trimmed(&self) -> Result<u64> {
+        self.check()?;
+        Ok(self.trimmed.load(Ordering::Relaxed))
     }
 
     async fn healthy(&self) -> bool {
@@ -308,8 +317,16 @@ mod tests {
         for i in 0..10 {
             queue.publish(&[(0, observation(i))]).await.unwrap();
         }
-        assert_eq!(queue.read(0, 4).await.unwrap().len(), 4);
-        assert_eq!(queue.depth(0).await.unwrap(), 6);
+        let taken = queue.read(0, 4).await.unwrap();
+        assert_eq!(taken.len(), 4);
+        assert_eq!(
+            queue.depth(0).await.unwrap(),
+            10,
+            "taken is not done: six waiting, four in flight"
+        );
+        let ids: Vec<String> = taken.iter().map(|e| e.id.clone()).collect();
+        queue.ack(0, &ids).await.unwrap();
+        assert_eq!(queue.depth(0).await.unwrap(), 6, "finished work leaves the depth");
     }
 
     #[tokio::test]
@@ -320,7 +337,7 @@ mod tests {
         }
 
         assert_eq!(queue.depth(0).await.unwrap(), 3, "the cap holds");
-        assert_eq!(queue.trimmed(), 2, "and the loss is counted, not silent");
+        assert_eq!(queue.trimmed().await.unwrap(), 2, "and the loss is counted, not silent");
 
         // The survivors are the newest, which is what makes the loss cheap.
         let keys: Vec<StationKey> =
@@ -354,7 +371,7 @@ mod tests {
         queue.publish(&[(0, observation(1)), (0, observation(2))]).await.unwrap();
 
         let first = queue.read(0, 10).await.unwrap(); // taken, then the worker dies
-        assert_eq!(queue.depth(0).await.unwrap(), 0);
+        assert_eq!(queue.depth(0).await.unwrap(), 2, "still not done");
 
         let again = queue.read(0, 10).await.unwrap();
         let ids = |entries: &[Entry]| entries.iter().map(|e| e.id.clone()).collect::<Vec<_>>();

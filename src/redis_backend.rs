@@ -116,7 +116,10 @@ pub struct RedisQueue {
     consumer: String,
     /// How long an entry sits unacknowledged before it is taken again.
     redeliver_after: std::time::Duration,
-    trimmed: Arc<AtomicU64>,
+    shards: u32,
+    /// Entries already trimmed when this handle was opened, so a restart does
+    /// not report the same loss twice.
+    trimmed_at_open: u64,
 }
 
 impl RedisQueue {
@@ -133,12 +136,52 @@ impl RedisQueue {
             group: "ichnos".into(),
             consumer,
             redeliver_after,
-            trimmed: Arc::new(AtomicU64::new(0)),
+            shards,
+            trimmed_at_open: 0,
         };
         for shard in 0..shards {
             queue.ensure_group(shard).await?;
         }
-        Ok(queue)
+        let trimmed_at_open = queue.trimmed_ever().await.unwrap_or(0);
+        Ok(Self { trimmed_at_open, ..queue })
+    }
+
+    /// Where the count of entries deleted after being done is kept.
+    fn acked_key(shard: u32) -> String {
+        format!("obs:{shard}:acked")
+    }
+
+    /// Entries the cap has discarded from every shard, ever.
+    ///
+    /// Redis does not count trims, but it counts everything ever added to a
+    /// stream (Redis 7 and later), and every entry that leaves a stream either
+    /// was deleted after being done, which is counted here, or was trimmed.
+    /// So what was trimmed is what was added, less what is still there, less
+    /// what was deleted. An entry trimmed after it was done but before its
+    /// deletion is counted too; that needs a backlog past the cap, which is
+    /// the loss this counts anyway.
+    async fn trimmed_ever(&self) -> Result<u64, QueueError> {
+        let mut conn = self.conn.clone();
+        let mut total = 0u64;
+        for shard in 0..self.shards {
+            let info: redis::Value = redis::cmd("XINFO")
+                .arg("STREAM")
+                .arg(Self::stream(shard))
+                .query_async(&mut conn)
+                .await
+                .map_err(|e| QueueError::Failed(e.to_string()))?;
+            let (length, added) = stream_counts(&info).ok_or_else(|| {
+                QueueError::Failed(
+                    "XINFO STREAM has no entries-added; Redis 7 or later is needed".into(),
+                )
+            })?;
+            let deleted: Option<u64> = conn
+                .get(Self::acked_key(shard))
+                .await
+                .map_err(|e| QueueError::Failed(e.to_string()))?;
+            total += added.saturating_sub(length).saturating_sub(deleted.unwrap_or(0));
+        }
+        Ok(total)
     }
 
     fn stream(shard: u32) -> String {
@@ -290,17 +333,21 @@ impl Queue for RedisQueue {
     }
 
     async fn ack(&self, shard: u32, ids: &[String]) -> Result<(), QueueError> {
-        if ids.is_empty() {
-            return Ok(());
-        }
         let mut conn = self.conn.clone();
-        redis::cmd("XACK")
-            .arg(Self::stream(shard))
-            .arg(&self.group)
-            .arg(ids)
-            .query_async::<i64>(&mut conn)
-            .await
-            .map_err(|e| QueueError::Failed(e.to_string()))?;
+        // Acknowledging does not remove an entry from a stream. Without the
+        // delete every stream would sit at its cap for ever, so depth would
+        // count finished work and the cap would trim what was already done.
+        // Chunked, because a script can unpack only so many arguments.
+        for chunk in ids.chunks(1_000) {
+            redis::Script::new(ACK_SCRIPT)
+                .key(Self::stream(shard))
+                .key(Self::acked_key(shard))
+                .arg(&self.group)
+                .arg(chunk)
+                .invoke_async::<i64>(&mut conn)
+                .await
+                .map_err(|e| QueueError::Failed(e.to_string()))?;
+        }
         Ok(())
     }
 
@@ -314,17 +361,46 @@ impl Queue for RedisQueue {
         Ok(len.max(0) as usize)
     }
 
-    fn trimmed(&self) -> u64 {
-        // Redis trims on its own and does not report how much, so this counts
-        // only what this process knows about. Stream depth against the cap is
-        // the signal to watch.
-        self.trimmed.load(Ordering::Relaxed)
+    async fn trimmed(&self) -> Result<u64, QueueError> {
+        Ok(self.trimmed_ever().await?.saturating_sub(self.trimmed_at_open))
     }
 
     async fn healthy(&self) -> bool {
         let mut conn = self.conn.clone();
         redis::cmd("PING").query_async::<String>(&mut conn).await.is_ok()
     }
+}
+
+/// Acknowledge and delete in one step, and count the deletions, so trims can
+/// be told apart from finished work.
+const ACK_SCRIPT: &str = r#"
+redis.call('XACK', KEYS[1], ARGV[1], unpack(ARGV, 2))
+local deleted = redis.call('XDEL', KEYS[1], unpack(ARGV, 2))
+if deleted > 0 then
+  redis.call('INCRBY', KEYS[2], deleted)
+end
+return deleted
+"#;
+
+/// The length and the entries-ever-added of an XINFO STREAM reply, which is a
+/// flat list of names and values.
+fn stream_counts(info: &redis::Value) -> Option<(u64, u64)> {
+    let redis::Value::Array(pairs) = info else { return None };
+    let mut length = None;
+    let mut added = None;
+    for pair in pairs.chunks(2) {
+        let (Some(name), Some(redis::Value::Int(value))) =
+            (pair.first().and_then(as_string), pair.get(1))
+        else {
+            continue;
+        };
+        match name.as_str() {
+            "length" => length = Some(*value as u64),
+            "entries-added" => added = Some(*value as u64),
+            _ => {}
+        }
+    }
+    Some((length?, added?))
 }
 
 /// Pull entries out of an XREADGROUP reply.
