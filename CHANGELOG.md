@@ -4,6 +4,11 @@
 
 ### Fixed
 
+- **A worker's metrics were never scraped.** `ichnos worker` opened no port,
+  so everything measured on the write path (leases held and lost, fold
+  ratio, elision, write and lease errors, queue lag) existed only in the
+  worker's memory. A worker now serves `/health` and `/metrics` on
+  `server.bind`, and the Kubernetes manifest scrapes it.
 - **Finished queue entries were never removed, so the queue metrics and the
   cap were both wrong.** Acknowledging does not delete an entry from a Redis
   stream, and nothing else did, so every stream filled to its cap and stayed

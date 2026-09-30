@@ -7,7 +7,7 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use ichnos::api::auth::KeyCache;
-use ichnos::api::handlers::{router, AppState};
+use ichnos::api::handlers::{router, worker_router, AppState};
 use ichnos::api::quota::{MemoryQuota, QuotaCounter};
 use ichnos::config::Config;
 use ichnos::ingest::lease::Leases;
@@ -301,6 +301,20 @@ async fn run_worker(cfg: Config, in_memory: bool, identity_arg: Option<String>) 
     });
 
     spawn_depth_poller(&cfg, queue.clone(), rx.clone());
+
+    // Serve the worker's own metrics, or nothing it measures is ever scraped.
+    let bind = cfg.server.bind.clone();
+    let listener =
+        tokio::net::TcpListener::bind(&bind).await.with_context(|| format!("binding {bind}"))?;
+    info!(address = %bind, "serving worker metrics");
+    let mut stop = rx.clone();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, worker_router())
+            .with_graceful_shutdown(async move {
+                let _ = stop.wait_for(|stopped| *stopped).await;
+            })
+            .await;
+    });
 
     let mut worker = Worker::new(queue, store, leases, cfg, identity);
     // Announce before claiming, or this worker counts itself as the only one

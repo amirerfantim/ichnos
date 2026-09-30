@@ -61,6 +61,15 @@ pub fn router(state: AppState) -> Router {
         .with_state(state)
 }
 
+/// The routes a worker process serves: liveness and its metrics.
+///
+/// A worker answers no requests, but everything it measures (leases, folding,
+/// elision, write errors) lives in its own process. Without a listener those
+/// numbers exist only in memory and no scrape ever sees them.
+pub fn worker_router() -> Router {
+    Router::new().route("/health", get(health)).route("/metrics", get(prometheus_metrics))
+}
+
 // ---------------------------------------------------------- observations ----
 
 /// Accept a batch of reports.
