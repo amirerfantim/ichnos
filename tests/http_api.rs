@@ -611,3 +611,78 @@ async fn a_body_over_the_limit_is_refused_as_an_unreadable_one() {
         assert_eq!(response.json::<Value>()["error"]["message"], "Invalid request body");
     }
 }
+
+#[tokio::test]
+async fn the_same_question_always_gets_the_same_answer_to_the_last_bit() {
+    // Stations used to be kept in a hash map, whose order is random per
+    // request, and were summed in that order: the answer moved in its last
+    // bits from one request to the next.
+    let h = Harness::new().await;
+    let macs = [
+        ("aabbccddee01", -65),
+        ("aabbccddee02", -70),
+        ("aabbccddee03", -58),
+        ("aabbccddee04", -80),
+        ("aabbccddee05", -62),
+        ("aabbccddee06", -75),
+    ];
+    for (i, (lat, lon)) in
+        [(35.72190, 51.33470), (35.72195, 51.33480), (35.72185, 51.33462)].into_iter().enumerate()
+    {
+        h.submit(report(lat, lon, &macs[i * 2..])).await;
+    }
+    h.drain().await;
+
+    let first = h
+        .server
+        .post("/v1/locate")
+        .add_query_param("key", "test-key")
+        .add_query_param("explain", "1")
+        .json(&ask(&macs))
+        .await
+        .text();
+    for _ in 0..30 {
+        let again = h
+            .server
+            .post("/v1/locate")
+            .add_query_param("key", "test-key")
+            .add_query_param("explain", "1")
+            .json(&ask(&macs))
+            .await
+            .text();
+        assert_eq!(again, first);
+    }
+}
+
+#[tokio::test]
+async fn exactly_one_candidate_is_marked_chosen_even_when_two_share_a_position() {
+    // A WiFi cluster and a cell learned from one report sit on the very same
+    // point. Marking every candidate at the winner's position marked both.
+    let h = Harness::new().await;
+    let tower = json!({"radioType": "lte", "mobileCountryCode": 432, "mobileNetworkCode": 11,
+                       "locationAreaCode": 1234, "cellId": 56789, "signalStrength": -105});
+    h.submit(json!({"items": [{
+        "position": {"latitude": 35.623037, "longitude": 51.309904, "accuracy": 10},
+        "wifiAccessPoints": [{"macAddress": "aabbccddee01", "signalStrength": -65},
+                             {"macAddress": "aabbccddee02", "signalStrength": -65}],
+        "cellTowers": [tower.clone()]
+    }]}))
+    .await;
+    h.drain().await;
+
+    let body: Value = h
+        .server
+        .post("/v1/locate")
+        .add_query_param("key", "test-key")
+        .add_query_param("explain", "1")
+        .json(&json!({
+            "wifiAccessPoints": [{"macAddress": "aabbccddee01", "signalStrength": -65},
+                                 {"macAddress": "aabbccddee02", "signalStrength": -65}],
+            "cellTowers": [tower]}))
+        .await
+        .json();
+    let clusters = body["explain"]["clusters"].as_array().unwrap();
+    assert_eq!(clusters.len(), 2, "{body}");
+    let chosen = clusters.iter().filter(|c| c["chosen"] == true).count();
+    assert_eq!(chosen, 1, "{body}");
+}

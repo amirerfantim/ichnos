@@ -184,20 +184,24 @@ pub fn best_cluster(results: &[Position]) -> Vec<&Position> {
 /// Within the winning group, the tightest accuracy wins, and a tie is broken by
 /// the higher score.
 pub fn best(results: &[Position]) -> Option<Position> {
+    best_index(results).map(|i| results[i].clone())
+}
+
+/// Where in `results` the best answer is, so a caller can tell it from a
+/// candidate that merely has the same position.
+pub fn best_index(results: &[Position]) -> Option<usize> {
     let group = best_cluster(results);
-    match group.len() {
-        0 => None,
-        1 => Some(group[0].clone()),
-        _ => group
-            .into_iter()
-            .min_by(|a, b| {
-                a.accuracy
-                    .partial_cmp(&b.accuracy)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-                    .then(b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal))
-            })
-            .cloned(),
-    }
+    let chosen = match group.len() {
+        0 => return None,
+        1 => group[0],
+        _ => group.into_iter().min_by(|a, b| {
+            a.accuracy
+                .partial_cmp(&b.accuracy)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal))
+        })?,
+    };
+    results.iter().position(|r| std::ptr::eq(r, chosen))
 }
 
 /// Locate a device from the stations it reported seeing.
@@ -401,6 +405,7 @@ mod tests {
     #[test]
     fn best_of_nothing_is_nothing() {
         assert!(best(&[]).is_none());
+        assert!(best_index(&[]).is_none());
         assert!(best_cluster(&[]).is_empty());
     }
 
@@ -443,5 +448,22 @@ mod tests {
         assert!(answer.accuracy.is_finite() && answer.accuracy > 0.0);
         assert!((-90.0..=90.0).contains(&answer.lat));
         assert!((-180.0..=180.0).contains(&answer.lon));
+    }
+
+    #[test]
+    fn the_best_index_names_the_winner_not_its_twin() {
+        // Two candidates with the same position and score: the index says
+        // which one won, where comparing positions would say both.
+        let twin = || Position {
+            lat: 35.7,
+            lon: 51.3,
+            accuracy: 20.0,
+            score: 1.0,
+            source: PositionSource::Wifi,
+            used: vec![],
+        };
+        let results = [twin(), twin()];
+        assert_eq!(best_index(&results), Some(0), "the first of equal minima");
+        assert_eq!(best(&results), Some(twin()));
     }
 }
