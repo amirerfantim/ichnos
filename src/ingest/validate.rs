@@ -776,14 +776,16 @@ mod tests {
 
     #[test]
     fn cells_compare_timing_advance_first() {
+        // The earlier sighting is nearer but older: on age alone the later
+        // one would win, and timing advance comes first.
         let mut report = item();
         report.wifi_access_points.clear();
         report.cell_towers = vec![
-            CellTower { timing_advance: Some(9), signal_strength: Some(-100), ..good_cell() },
-            CellTower { timing_advance: Some(2), signal_strength: Some(-100), ..good_cell() },
+            CellTower { timing_advance: Some(2), age: Some(300.0), ..good_cell() },
+            CellTower { timing_advance: Some(9), age: Some(100.0), ..good_cell() },
         ];
         let out = validate_item(&report, &Validation::default());
-        assert_eq!(out.observations.len(), 1);
+        assert_eq!(out.observations[0].age_ms, Some(300.0));
         assert_eq!(out.dropped, vec![DropReason::Duplicate]);
     }
 
