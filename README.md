@@ -85,7 +85,7 @@ With real storage:
 
 ```bash
 docker compose up -d                      # ScyllaDB and two Redis instances
-cqlsh -f schema/001_init.cql              # once
+cqlsh -f schema/001_init.cql              # once; 002 upgrades an older keyspace
 cargo run -- keys add my-key --locate --submit
 cargo run -- serve                        # the API
 cargo run -- worker                       # the writer, in another terminal
@@ -227,6 +227,7 @@ Some of the ones worth knowing:
 | `block.budget_days` | `10` | One forgiven block per this many days of known age |
 | `cache.miss_ttl_secs` | `60` | How long an unknown station stays cached as unknown |
 | `cql.ttl_days` | `180` | Row lifetime, refreshed by every write |
+| `api.locate_sample_percent` | `100` | Scales every key's learning from locates; 0 stops it |
 
 Run `ichnos show-config` for the full list with defaults.
 
@@ -248,6 +249,7 @@ ichnos worker                 # drain the queue and write
 ichnos replay traffic.ndjson  # run recorded traffic through the pipeline
 ichnos import stations.ndjson # load a station table
 ichnos keys add KEY --locate --submit
+ichnos keys add KEY --locate --store-sample-locate 100   # also learn from its answers
 ichnos show-config
 ```
 
@@ -309,6 +311,7 @@ say whether the service is good at its job.
 |---|---|
 | `ichnos_locate_accuracy_meters{source}` | How precise the answers actually were. |
 | `ichnos_locate_coverage` | Known networks over asked-about networks. |
+| `ichnos_locate_learned_total{outcome}` | Answers offered for learning: `queued`, `sampled_out`, `nothing_new`, `nothing_valid`, `lost`. |
 | `ichnos_locate_no_answer_total{reason}` | `nothing_submitted`, `none_known`, `no_cluster`, `store_unavailable`. `none_known` is a coverage problem; `no_cluster` is not. |
 | `ichnos_locate_disagreement_meters` | How far the runner-up candidate sat from the winner. One device should not see two sets of stations that disagree by kilometres; when it does, either the stations are wrong or the report is not honest. |
 | `ichnos_locate_cluster_size{source}`, `ichnos_locate_score{source}` | How much evidence stood behind each answer. |

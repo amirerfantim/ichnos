@@ -242,6 +242,7 @@ struct ApiKeyRow {
     allow_submit: Option<bool>,
     allow_admin: Option<bool>,
     daily_quota: Option<i64>,
+    store_sample_locate: Option<i32>,
 }
 
 /// Prepared statements, made once at startup.
@@ -365,15 +366,16 @@ impl CqlStore {
             )
             .await?,
             select_api_key: prepare(
-                "SELECT key, name, enabled, allow_locate, allow_submit, allow_admin, daily_quota \
-                 FROM api_key WHERE key = ?"
+                "SELECT key, name, enabled, allow_locate, allow_submit, allow_admin, daily_quota, \
+                 store_sample_locate FROM api_key WHERE key = ?"
                     .to_string(),
                 read,
             )
             .await?,
             insert_api_key: prepare(
                 "INSERT INTO api_key (key, name, enabled, allow_locate, allow_submit, \
-                 allow_admin, daily_quota, created) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+                 allow_admin, daily_quota, store_sample_locate, created) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
                     .to_string(),
                 write,
             )
@@ -575,6 +577,9 @@ impl Store for CqlStore {
                 allow_submit: row.allow_submit.unwrap_or(false),
                 allow_admin: row.allow_admin.unwrap_or(false),
                 daily_quota: row.daily_quota.unwrap_or(0),
+                store_sample_locate: row
+                    .store_sample_locate
+                    .map_or(0, |v| u8::try_from(v.clamp(0, 100)).unwrap_or(0)),
             })),
             Some(Err(e)) => Err(StoreError::Malformed(e.to_string())),
             None => Ok(None),
@@ -593,6 +598,7 @@ impl Store for CqlStore {
                     api_key.allow_submit,
                     api_key.allow_admin,
                     api_key.daily_quota,
+                    i32::from(api_key.store_sample_locate),
                     Utc::now(),
                 ),
             )

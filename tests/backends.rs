@@ -198,6 +198,7 @@ async fn api_keys_survive_a_round_trip_through_the_database() {
         allow_submit: false,
         allow_admin: true,
         daily_quota: 500,
+        store_sample_locate: 37,
     };
     store.put_api_key(&key).await.unwrap();
 

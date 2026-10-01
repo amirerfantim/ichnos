@@ -1,6 +1,7 @@
 //! The HTTP surface: two endpoints clients use, and a few for operators.
 
 use crate::api::auth::{AuthError, KeyCache, Permission};
+use crate::api::learn;
 use crate::api::quota::{consume, QuotaCounter, QuotaVerdict};
 use crate::api::schema::*;
 use crate::config::Config;
@@ -289,6 +290,7 @@ async fn locate(
     m.locate_score.with_label_values(&[source]).observe(answer.score);
     m.locate_stale_networks.inc_by(answer.used.iter().filter(|u| !u.seen_today).count() as u64);
     record_disagreement(&candidates, answer);
+    learn_from(&state, api_key.as_ref(), &request, answer);
 
     let explain = query
         .wants_explain()
@@ -300,6 +302,50 @@ async fn locate(
         explain,
     };
     finish("locate", started, (StatusCode::OK, Json(response)).into_response())
+}
+
+/// Feed an answer back as a report, when its key asks for that.
+///
+/// Deciding is cheap and done here; the publish runs on its own so the answer
+/// never waits for the queue.
+fn learn_from(
+    state: &AppState,
+    key: Option<&crate::store::ApiKey>,
+    request: &LocateRequest,
+    answer: &locate::Position,
+) {
+    let m = metrics();
+    let Some(key) = key.filter(|k| k.store_sample_locate > 0) else {
+        return;
+    };
+    if !learn::sampled(key.store_sample_locate, state.cfg.api.locate_sample_percent, rand::random())
+    {
+        m.locate_learned.with_label_values(&["sampled_out"]).inc();
+        return;
+    }
+    let Some(item) = learn::report(request, answer, &state.cfg) else {
+        m.locate_learned.with_label_values(&["nothing_new"]).inc();
+        return;
+    };
+    let validated = validate_item(&item, &state.cfg.validation);
+    let shards = state.cfg.ingest.shards;
+    let routed: Vec<(u32, Observation)> =
+        validated.observations.into_iter().map(|o| (o.key.shard(shards), o)).collect();
+    if routed.is_empty() {
+        m.locate_learned.with_label_values(&["nothing_valid"]).inc();
+        return;
+    }
+    let queue = state.queue.clone();
+    tokio::spawn(async move {
+        match queue.publish(&routed).await {
+            Ok(_) => m.locate_learned.with_label_values(&["queued"]).inc(),
+            Err(e) => {
+                tracing::warn!(error = %e, "could not queue what a locate taught");
+                m.queue_errors.with_label_values(&["publish"]).inc();
+                m.locate_learned.with_label_values(&["lost"]).inc();
+            }
+        }
+    });
 }
 
 /// The stations a request asked about, with what the client reported of each,

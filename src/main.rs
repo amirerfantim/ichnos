@@ -103,6 +103,10 @@ enum KeyAction {
         submit: bool,
         #[arg(long)]
         admin: bool,
+        /// Percent of answered locates fed back as reports, as upstream's
+        /// store_sample_locate. Zero never does.
+        #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(u8).range(0..=100))]
+        store_sample_locate: u8,
     },
     /// Show one key.
     Show { key: String },
@@ -375,7 +379,7 @@ async fn export(_cfg: Config, in_memory: bool, output: &std::path::Path) -> Resu
 async fn keys(cfg: Config, in_memory: bool, action: KeyAction) -> Result<()> {
     let store = build_store(&cfg, in_memory).await?;
     match action {
-        KeyAction::Add { key, name, locate, submit, admin } => {
+        KeyAction::Add { key, name, locate, submit, admin, store_sample_locate } => {
             let api_key = ApiKey {
                 key: key.clone(),
                 name,
@@ -384,6 +388,7 @@ async fn keys(cfg: Config, in_memory: bool, action: KeyAction) -> Result<()> {
                 allow_submit: submit,
                 allow_admin: admin,
                 daily_quota: cfg.api.default_daily_quota,
+                store_sample_locate,
             };
             store.put_api_key(&api_key).await.map_err(|e| anyhow::anyhow!("{e}"))?;
             println!("added key {key}: locate={locate} submit={submit} admin={admin}");
