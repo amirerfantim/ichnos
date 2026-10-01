@@ -46,6 +46,11 @@ pub struct ApiKey {
     pub allow_admin: bool,
     /// Requests per day. Zero means no limit.
     pub daily_quota: i64,
+    /// Percent of this key's answered locates that are fed back as reports,
+    /// teaching the networks it named at the position it was given. Zero, the
+    /// default as upstream, never does.
+    #[serde(default)]
+    pub store_sample_locate: u8,
 }
 
 impl ApiKey {
@@ -59,6 +64,7 @@ impl ApiKey {
             allow_submit: true,
             allow_admin: true,
             daily_quota: 0,
+            store_sample_locate: 0,
         }
     }
 }

@@ -151,6 +151,9 @@ pub struct Metrics {
     pub locate_networks: IntCounterVec,
     /// Why no answer came back. The reason is the whole value of this metric.
     pub locate_no_answer: IntCounterVec,
+    /// What became of each answer offered for learning: queued, sampled out,
+    /// nothing new in it, nothing valid in it, or lost to the queue.
+    pub locate_learned: IntCounterVec,
     pub locate_accuracy: HistogramVec,
     /// Known stations over submitted stations: is the database learning?
     pub locate_coverage: Histogram,
@@ -429,6 +432,11 @@ impl Metrics {
                 "ichnos_locate_no_answer_total",
                 "Locate requests that returned nothing, by why",
                 &["reason"],
+            ),
+            locate_learned: counter_vec(
+                "ichnos_locate_learned_total",
+                "Answered locates offered for learning, by what became of them",
+                &["outcome"],
             ),
             locate_accuracy: histogram_vec(
                 "ichnos_locate_accuracy_meters",

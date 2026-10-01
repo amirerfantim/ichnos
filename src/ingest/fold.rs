@@ -15,6 +15,7 @@ use crate::geo::{circle_radius, distance};
 use crate::model::observation::ReportSource;
 use crate::model::{Observation, Station, StationKey, StationKind};
 use chrono::{DateTime, Duration, NaiveDate, Utc};
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 
 /// Ceilings that stop a long-lived station overflowing its columns.
@@ -106,10 +107,11 @@ pub fn fold_station(
         StationKind::Cell => cfg.station.cell_max_radius_m,
     };
 
+    let (observations, source) = evidence(observations);
+    let observations = observations.as_ref();
     let obs_data = aggregate(observations, cfg, max_dist);
-    let source = best_source(observations);
 
-    let action = decide(existing, obs_data.as_ref(), observations, max_dist, today, cfg);
+    let action = decide(existing, obs_data.as_ref(), observations, source, max_dist, today, cfg);
 
     let station = match action {
         Action::Nothing => {
@@ -174,7 +176,7 @@ pub fn fold_station(
             let data = obs_data.expect("Change requires coherent observations");
             let mut station = existing.cloned().unwrap_or_else(|| Station::new(key, now));
             blend(&mut station, &data, cfg);
-            station.source = Some(source.min_quality(station.source));
+            station.source = Some(source);
             station.last_seen = Some(today);
             station.modified = now;
             station
@@ -197,12 +199,12 @@ fn decide(
     existing: Option<&Station>,
     obs_data: Option<&ObsData>,
     observations: &[Observation],
+    source: ReportSource,
     max_dist: f64,
     today: NaiveDate,
     cfg: &Config,
 ) -> Action {
     let consistent = obs_data.is_some();
-    let source = best_source(observations);
     let from_query = source == ReportSource::Query;
 
     let Some(station) = existing else {
@@ -362,19 +364,23 @@ fn h3_cell(lat: f64, lon: f64, resolution: u8) -> Option<i64> {
     Some(u64::from(coord.to_cell(resolution)) as i64)
 }
 
-/// The best-quality source in a batch. Lower is better.
-fn best_source(observations: &[Observation]) -> ReportSource {
-    observations.iter().map(|o| o.source).min_by_key(|s| s.as_i8()).unwrap_or(ReportSource::Gnss)
-}
-
-impl ReportSource {
-    /// Keep the better of two sources, treating an absent one as unknown.
-    fn min_quality(self, other: Option<ReportSource>) -> ReportSource {
-        match other {
-            Some(o) if o.as_i8() < self.as_i8() => o,
-            _ => self,
-        }
+/// The evidence a station is judged on, and what kind it is.
+///
+/// Upstream weighs one kind at a time: the batch's measured fixes when it has
+/// any, and its guesses (positions inferred from a locate answer) only when it
+/// has none, so a guess never moves a position that a fix in the same batch
+/// speaks for. A fused or fixed position counts as measured.
+fn evidence(observations: &[Observation]) -> (Cow<'_, [Observation]>, ReportSource) {
+    let guesses = observations.iter().filter(|o| o.source == ReportSource::Query).count();
+    if guesses == observations.len() && guesses > 0 {
+        return (Cow::Borrowed(observations), ReportSource::Query);
     }
+    if guesses == 0 {
+        return (Cow::Borrowed(observations), ReportSource::Gnss);
+    }
+    let measured =
+        observations.iter().filter(|o| o.source != ReportSource::Query).cloned().collect();
+    (Cow::Owned(measured), ReportSource::Gnss)
 }
 
 fn bound_samples(samples: i64) -> i32 {
@@ -603,6 +609,54 @@ mod tests {
         assert_eq!(update.action, Action::Replace);
         assert!(update.station.has_position());
         assert_eq!(update.station.block_count, 0, "and it is not held against the station");
+    }
+
+    #[test]
+    fn a_batch_of_fixes_and_guesses_is_judged_on_the_fixes_alone() {
+        // The guess sits 3 km away; were it averaged in, the new station
+        // would land between the two.
+        let cfg = Config::for_tests();
+        let mut guess = obs_at(35.7500, 51.3347);
+        guess.source = ReportSource::Query;
+        let update = fold_station(key(), &[obs_at(35.7219, 51.3347), guess], None, &cfg, now());
+        assert_eq!(update.action, Action::New);
+        assert!((update.station.lat.unwrap() - 35.7219).abs() < 1e-9);
+        assert_eq!(update.station.samples, 1);
+        assert_eq!(update.station.source, Some(ReportSource::Gnss));
+    }
+
+    #[test]
+    fn a_batch_of_guesses_alone_makes_a_guessed_station() {
+        let cfg = Config::for_tests();
+        let mut guess = obs_at(35.7219, 51.3347);
+        guess.source = ReportSource::Query;
+        let update = fold_station(key(), &[guess], None, &cfg, now());
+        assert_eq!(update.action, Action::New);
+        assert_eq!(update.station.source, Some(ReportSource::Query));
+    }
+
+    #[test]
+    fn a_fused_or_fixed_position_is_recorded_as_a_measurement() {
+        let cfg = Config::for_tests();
+        for source in [ReportSource::Fused, ReportSource::Fixed] {
+            let mut fix = obs_at(35.7219, 51.3347);
+            fix.source = source;
+            let update = fold_station(key(), &[fix], None, &cfg, now());
+            assert_eq!(update.station.source, Some(ReportSource::Gnss), "{source:?}");
+        }
+    }
+
+    #[test]
+    fn a_guess_agreeing_with_a_guessed_station_blends_in() {
+        let cfg = Config::for_tests();
+        let mut guessed = existing_at(35.7219, 51.3347, 1.0);
+        guessed.source = Some(ReportSource::Query);
+        let mut guess = obs_at(35.7220, 51.3348);
+        guess.source = ReportSource::Query;
+        let update = fold_station(key(), &[guess], Some(&guessed), &cfg, now());
+        assert_eq!(update.action, Action::Change);
+        assert_eq!(update.station.source, Some(ReportSource::Query));
+        assert_ne!(update.station.lat, guessed.lat);
     }
 
     #[test]
