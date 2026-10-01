@@ -90,5 +90,6 @@ CREATE TABLE IF NOT EXISTS ichnos.api_key (
   allow_submit boolean,
   allow_admin  boolean,
   daily_quota  bigint,
+  store_sample_locate int,
   created      timestamp
 );

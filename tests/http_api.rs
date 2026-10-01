@@ -10,7 +10,10 @@ use ichnos::api::auth::KeyCache;
 use ichnos::api::handlers::{router, worker_router, AppState};
 use ichnos::api::quota::MemoryQuota;
 use ichnos::config::Config;
-use ichnos::ingest::queue::MemoryQueue;
+use ichnos::ingest::queue::{MemoryQueue, Queue};
+use ichnos::model::key::WifiKey;
+use ichnos::model::observation::ReportSource;
+use ichnos::model::StationKey;
 use ichnos::store::cache::{CachedStore, MemoryCache};
 use ichnos::store::memory::MemoryStore;
 use ichnos::store::{ApiKey, Store};
@@ -41,6 +44,11 @@ impl Harness {
                 allow_admin: false,
                 ..ApiKey::full("read-only")
             })
+            .await
+            .unwrap();
+
+        inner
+            .put_api_key(&ApiKey { store_sample_locate: 100, ..ApiKey::full("learner") })
             .await
             .unwrap();
 
@@ -80,6 +88,34 @@ impl Harness {
             self.server.post("/v1/locate").add_query_param("key", "test-key").json(&body).await;
         let status = response.status_code().as_u16();
         (status, response.json::<Value>())
+    }
+}
+
+impl Harness {
+    async fn locate_as(&self, key: &str, body: Value) -> u16 {
+        self.server
+            .post("/v1/locate")
+            .add_query_param("key", key)
+            .json(&body)
+            .await
+            .status_code()
+            .as_u16()
+    }
+
+    /// Wait for what an answer taught to reach the queue: it is published
+    /// after the response, on its own task.
+    async fn queued(&self) -> usize {
+        for _ in 0..1_000 {
+            let mut total = 0;
+            for shard in 0..self.cfg.ingest.shards {
+                total += self.queue.depth(shard).await.unwrap();
+            }
+            if total > 0 {
+                return total;
+            }
+            tokio::task::yield_now().await;
+        }
+        0
     }
 }
 
@@ -685,4 +721,61 @@ async fn exactly_one_candidate_is_marked_chosen_even_when_two_share_a_position()
     assert_eq!(clusters.len(), 2, "{body}");
     let chosen = clusters.iter().filter(|c| c["chosen"] == true).count();
     assert_eq!(chosen, 1, "{body}");
+}
+
+#[tokio::test]
+async fn a_learning_key_teaches_the_networks_it_asked_about() {
+    let h = Harness::new().await;
+    let known = [("aabbccddee01", -65), ("aabbccddee02", -70)];
+    assert_eq!(h.submit(report(35.7219, 51.3347, &known)).await, 200);
+    h.drain().await;
+
+    // A third access point the service has never seen, asked about with
+    // the two it knows.
+    let asked = [("aabbccddee01", -65), ("aabbccddee02", -70), ("aabbccddee03", -75)];
+    assert_eq!(h.locate_as("learner", ask(&asked)).await, 200);
+    assert_eq!(h.queued().await, 3, "every network asked about is fed back");
+    h.drain().await;
+
+    let new = WifiKey::parse("aabbccddee03").unwrap();
+    let learned = h.store.get_station(&StationKey::Wifi(new)).await.unwrap().expect("learned");
+    assert_eq!(learned.source, Some(ReportSource::Query));
+    assert!((learned.lat.unwrap() - 35.7219).abs() < 0.001);
+    let known = WifiKey::parse("aabbccddee01").unwrap();
+    let confirmed = h.store.get_station(&StationKey::Wifi(known)).await.unwrap().unwrap();
+    assert_eq!(confirmed.source, Some(ReportSource::Gnss), "a guess never replaces a fix");
+}
+
+#[tokio::test]
+async fn a_key_that_does_not_learn_teaches_nothing() {
+    let h = Harness::new().await;
+    let known = [("aabbccddee01", -65), ("aabbccddee02", -70)];
+    assert_eq!(h.submit(report(35.7219, 51.3347, &known)).await, 200);
+    h.drain().await;
+
+    let asked = [("aabbccddee01", -65), ("aabbccddee02", -70), ("aabbccddee03", -75)];
+    assert_eq!(h.locate_as("test-key", ask(&asked)).await, 200);
+    for _ in 0..100 {
+        tokio::task::yield_now().await;
+    }
+    for shard in 0..h.cfg.ingest.shards {
+        assert_eq!(h.queue.depth(shard).await.unwrap(), 0);
+    }
+}
+
+#[tokio::test]
+async fn an_answer_with_nothing_new_in_it_teaches_nothing() {
+    let h = Harness::new().await;
+    let known = [("aabbccddee01", -65), ("aabbccddee02", -70)];
+    assert_eq!(h.submit(report(35.7219, 51.3347, &known)).await, 200);
+    h.drain().await;
+
+    // Both seen today and both used: upstream stores nothing.
+    assert_eq!(h.locate_as("learner", ask(&known)).await, 200);
+    for _ in 0..100 {
+        tokio::task::yield_now().await;
+    }
+    for shard in 0..h.cfg.ingest.shards {
+        assert_eq!(h.queue.depth(shard).await.unwrap(), 0);
+    }
 }

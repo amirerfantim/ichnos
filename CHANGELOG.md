@@ -2,8 +2,26 @@
 
 ## Unreleased
 
+### Added
+
+- **Learning from locate answers, as upstream does.** A key with
+  `store_sample_locate` above zero (`ichnos keys add --store-sample-locate`)
+  feeds that share of its answered locates back as reports: the networks the
+  request named, at the answered position, marked as a guess (`query`).
+  Upstream's rules throughout: an answer is skipped when every network it
+  named was used and already seen today (never when it named a cell); fewer
+  than two access points are not learned; the report passes the same
+  validation as a submitted one. `api.locate_sample_percent` scales every key,
+  like upstream's `global_locate_sample_rate`. Keys default to zero, as
+  upstream. Counted by `ichnos_locate_learned_total{outcome}`. An older
+  keyspace needs `schema/002_store_sample_locate.cql`.
+
 ### Fixed
 
+- **A batch mixing fixes and guesses averaged them together.** Upstream
+  judges a station on its measured fixes when a batch has any, and on guesses
+  only when it has none; and it records any measured fix, fused or fixed
+  included, as `gnss`. Both now hold.
 - **Reports were validated by stricter rules than Ichnaea's, and scans were
   aged from the wrong moment.** Measured against Ichnaea's own code over a
   million real reports: 80% of observations got a different weight, and

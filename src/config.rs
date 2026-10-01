@@ -466,6 +466,10 @@ pub struct Api {
     /// Refuse to start when no key is defined. Off makes local development
     /// easy; on is what you want anywhere real.
     pub require_keys: bool,
+    /// Scales every key's `store_sample_locate`, 0 to 100: the switch to
+    /// shed the learning from locates when the write path is behind.
+    /// source: global_locate_sample_rate
+    pub locate_sample_percent: f64,
 }
 
 impl Default for Api {
@@ -477,6 +481,7 @@ impl Default for Api {
             default_daily_quota: 0,
             key_cache_secs: 60,
             require_keys: true,
+            locate_sample_percent: 100.0,
         }
     }
 }
@@ -527,6 +532,12 @@ impl Config {
 
         if self.ingest.shards == 0 {
             return bad("ingest.shards must be at least 1".into());
+        }
+        if !(0.0..=100.0).contains(&self.api.locate_sample_percent) {
+            return bad(format!(
+                "api.locate_sample_percent ({}) must be between 0 and 100",
+                self.api.locate_sample_percent
+            ));
         }
         if self.ingest.fold_window_secs == 0 {
             return bad("ingest.fold_window_secs must be at least 1".into());
@@ -647,6 +658,18 @@ mod tests {
     fn cell_defaults_are_not_the_wifi_defaults() {
         let c = Config::for_tests();
         assert_ne!(c.locate.cell.min_accuracy_m, c.locate.wifi.min_accuracy_m);
+    }
+
+    #[test]
+    fn a_locate_sample_outside_a_percentage_is_rejected() {
+        for bad in [-1.0, 100.5, f64::NAN] {
+            let mut c = Config::for_tests();
+            c.api.locate_sample_percent = bad;
+            assert!(c.validate().is_err(), "{bad}");
+        }
+        let mut c = Config::for_tests();
+        c.api.locate_sample_percent = 0.0;
+        c.validate().unwrap();
     }
 
     #[test]
