@@ -18,6 +18,15 @@
 
 ### Fixed
 
+- **A blocked station was still learned from.** The read path hid blocked
+  stations, but the write path never checked: every report of a blocked
+  station was folded in, so a station blocked for moving recovered a position
+  at once, and each further disagreeing report counted another block against
+  it (821 stations blocked twice and 595 three or more times in a million real
+  reports, where Ichnaea blocks each once). Now, as upstream, a blocked
+  station's reports are ignored until the block ends, and counted as
+  `ichnos_station_writes_total{action="ignored_blocked"}`.
+
 - **A batch mixing fixes and guesses averaged them together.** Upstream
   judges a station on its measured fixes when a batch has any, and on guesses
   only when it has none; and it records any measured fix, fused or fixed
