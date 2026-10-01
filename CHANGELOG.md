@@ -4,6 +4,26 @@
 
 ### Fixed
 
+- **Reports were validated by stricter rules than Ichnaea's, and scans were
+  aged from the wrong moment.** Measured against Ichnaea's own code over a
+  million real reports: 80% of observations got a different weight, and
+  199,646 that Ichnaea keeps were dropped. Now, as upstream:
+  - a scan's age is measured from the position fix (`scan age - fix age`),
+    and the report's time is moved back to the fix. Ichnos used the scan's
+    age from the request, so a scan taken 3 s from an 8 s old fix counted
+    as 11 s old, and 165,695 scans looked too old to count at all;
+  - a field out of range is forgotten and its station kept: WiFi signal and
+    frequency, cell signal, timing advance and scrambling code, and the
+    fix's accuracy and speed. Only a missing or impossible identity, or
+    position, still drops data;
+  - a GSM cell id above 16 bits is taken as a WCDMA cell;
+  - a station named twice in one report keeps one sighting, chosen by
+    upstream's rule (timing advance, then signal, then age), and weighed
+    after the choice.
+
+  The labels `accuracy_out_of_range`, `speed_out_of_range`,
+  `age_out_of_range`, `frequency_out_of_range` and `signal_out_of_range` of
+  `ichnos_reports_dropped_total` are gone; `duplicate` is new.
 - **The same locate request could get a different answer each time.** The
   stations of a request were kept in a hash map, whose order is random per
   request, and summed in that order, so positions, accuracies and scores
