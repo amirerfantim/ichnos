@@ -138,12 +138,19 @@ async fn drain_once<Q: Queue + ?Sized, S: Store + ?Sized>(
 
     for (key, observations) in grouped {
         let previous = existing.get(&key);
-        let update = fold::fold_station(key, &observations, previous, cfg, now);
-
         let kind = match key.kind() {
             crate::model::key::StationKind::Wifi => "wifi",
             crate::model::key::StationKind::Cell => "cell",
         };
+        // A blocked station is not learned from. The block exists because its
+        // evidence disagreed with itself or with what was known; folding more
+        // of that evidence in would lift the block's effect at once, and count
+        // a fresh block against the station every time it was reported.
+        if previous.is_some_and(|p| p.is_blocked(today, &cfg.block)) {
+            m.station_writes.with_label_values(&[kind, "ignored_blocked"]).inc();
+            continue;
+        }
+        let update = fold::fold_station(key, &observations, previous, cfg, now);
         m.station_writes.with_label_values(&[kind, update.action.as_str()]).inc();
 
         match update.action {
@@ -584,6 +591,55 @@ mod tests {
         let station = store.get_station(&StationKey::Wifi(WifiKey(1))).await.unwrap().unwrap();
         assert!(!station.has_position());
         assert_eq!(station.block_count, 1);
+    }
+
+    #[tokio::test]
+    async fn a_blocked_station_is_not_learned_from_or_blocked_again() {
+        let cfg = cfg();
+        let queue = MemoryQueue::new(cfg.ingest.shards, 1_000);
+        let store = MemoryStore::new();
+        let key = StationKey::Wifi(WifiKey(1));
+        let shard = key.shard(cfg.ingest.shards);
+
+        publish(&queue, &cfg, vec![observation(1, 35.7219, 51.3347)]).await;
+        process_shard(&queue, &store, shard, &cfg).await.unwrap();
+        publish(&queue, &cfg, vec![observation(1, 36.5000, 52.0000)]).await;
+        process_shard(&queue, &store, shard, &cfg).await.unwrap();
+        let blocked = store.get_station(&key).await.unwrap().unwrap();
+        assert_eq!(blocked.block_count, 1);
+
+        // More reports, from anywhere, the same day: the station is blocked,
+        // so none of it counts.
+        for (lat, lon) in [(35.7219, 51.3347), (36.5000, 52.0000), (35.7220, 51.3348)] {
+            publish(&queue, &cfg, vec![observation(1, lat, lon)]).await;
+            let outcome = process_shard(&queue, &store, shard, &cfg).await.unwrap();
+            assert_eq!((outcome.written, outcome.blocked), (0, 0));
+        }
+        let after = store.get_station(&key).await.unwrap().unwrap();
+        assert_eq!(after, blocked, "nothing about the station changed");
+    }
+
+    #[tokio::test]
+    async fn a_station_whose_block_has_passed_is_learned_from_again() {
+        let mut cfg = cfg();
+        cfg.block.temporary_days = 1;
+        cfg.block.budget_days = 1.0;
+        let queue = MemoryQueue::new(cfg.ingest.shards, 1_000);
+        let store = MemoryStore::new();
+        let key = StationKey::Wifi(WifiKey(1));
+        let shard = key.shard(cfg.ingest.shards);
+
+        // A station known for ages, blocked once, last blocked long ago.
+        let mut old = Station::new(key, Utc::now() - chrono::Duration::days(400));
+        old.block_count = 1;
+        old.block_first = Some(Utc::now().date_naive() - chrono::Duration::days(300));
+        old.block_last = old.block_first;
+        store.put_stations(&[old]).await.unwrap();
+
+        publish(&queue, &cfg, vec![observation(1, 35.7219, 51.3347)]).await;
+        let outcome = process_shard(&queue, &store, shard, &cfg).await.unwrap();
+        assert_eq!(outcome.written, 1);
+        assert!(store.get_station(&key).await.unwrap().unwrap().has_position());
     }
 
     #[tokio::test]
