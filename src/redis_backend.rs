@@ -190,12 +190,18 @@ impl RedisQueue {
 
     /// Create the consumer group, tolerating the case where it already exists.
     async fn ensure_group(&self, shard: u32) -> Result<(), String> {
+        self.create_group(shard, "$").await
+    }
+
+    /// Create the consumer group reading from `start`, tolerating the case
+    /// where it already exists.
+    async fn create_group(&self, shard: u32, start: &str) -> Result<(), String> {
         let mut conn = self.conn.clone();
         let result: Result<String, redis::RedisError> = redis::cmd("XGROUP")
             .arg("CREATE")
             .arg(Self::stream(shard))
             .arg(&self.group)
-            .arg("$")
+            .arg(start)
             .arg("MKSTREAM")
             .query_async(&mut conn)
             .await;
@@ -259,6 +265,43 @@ impl RedisQueue {
         }
         Ok((entries, malformed))
     }
+
+    /// One read of a shard: stuck entries first, then new ones.
+    async fn read_group(&self, shard: u32, max: usize) -> Result<Vec<Entry>, QueueError> {
+        // Stuck entries first. `>` below only ever returns entries never
+        // delivered to anyone, so without this an entry whose worker died,
+        // lost the shard, or failed to write would stay pending for ever.
+        let (mut entries, mut malformed) = self.reclaim(shard, max).await?;
+        if entries.is_empty() {
+            let mut conn = self.conn.clone();
+            let reply: redis::Value = redis::cmd("XREADGROUP")
+                .arg("GROUP")
+                .arg(&self.group)
+                .arg(&self.consumer)
+                .arg("COUNT")
+                .arg(max)
+                .arg("STREAMS")
+                .arg(Self::stream(shard))
+                .arg(">")
+                .query_async(&mut conn)
+                .await
+                .map_err(|e| QueueError::Failed(e.to_string()))?;
+            let (fresh, bad) = parse_stream_reply(&reply);
+            entries = fresh;
+            malformed.extend(bad);
+        }
+
+        // An entry that cannot be decoded never will be. Acknowledge it now,
+        // or it would come back on every read for ever.
+        if !malformed.is_empty() {
+            crate::metrics::metrics()
+                .queue_errors
+                .with_label_values(&["decode"])
+                .inc_by(malformed.len() as u64);
+            self.ack(shard, &malformed).await?;
+        }
+        Ok(entries)
+    }
 }
 
 /// Upper bound on XAUTOCLAIM calls in one read.
@@ -297,39 +340,18 @@ impl Queue for RedisQueue {
     }
 
     async fn read(&self, shard: u32, max: usize) -> Result<Vec<Entry>, QueueError> {
-        // Stuck entries first. `>` below only ever returns entries never
-        // delivered to anyone, so without this an entry whose worker died,
-        // lost the shard, or failed to write would stay pending for ever.
-        let (mut entries, mut malformed) = self.reclaim(shard, max).await?;
-        if entries.is_empty() {
-            let mut conn = self.conn.clone();
-            let reply: redis::Value = redis::cmd("XREADGROUP")
-                .arg("GROUP")
-                .arg(&self.group)
-                .arg(&self.consumer)
-                .arg("COUNT")
-                .arg(max)
-                .arg("STREAMS")
-                .arg(Self::stream(shard))
-                .arg(">")
-                .query_async(&mut conn)
-                .await
-                .map_err(|e| QueueError::Failed(e.to_string()))?;
-            let (fresh, bad) = parse_stream_reply(&reply);
-            entries = fresh;
-            malformed.extend(bad);
+        match self.read_group(shard, max).await {
+            // The queue server lost its data, as one without persistence does
+            // when it restarts: publishing made the stream again, but not the
+            // group, and every read would fail until the worker restarted.
+            // Nobody has read the new stream, so the group starts at its
+            // beginning rather than its end.
+            Err(QueueError::Failed(e)) if e.contains("NOGROUP") => {
+                self.create_group(shard, "0").await.map_err(QueueError::Failed)?;
+                self.read_group(shard, max).await
+            }
+            other => other,
         }
-
-        // An entry that cannot be decoded never will be. Acknowledge it now,
-        // or it would come back on every read for ever.
-        if !malformed.is_empty() {
-            crate::metrics::metrics()
-                .queue_errors
-                .with_label_values(&["decode"])
-                .inc_by(malformed.len() as u64);
-            self.ack(shard, &malformed).await?;
-        }
-        Ok(entries)
     }
 
     async fn ack(&self, shard: u32, ids: &[String]) -> Result<(), QueueError> {
