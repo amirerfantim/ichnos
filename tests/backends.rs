@@ -580,3 +580,27 @@ async fn entries_dropped_unread_are_counted_exactly() {
         RedisQueue::connect(&url, 48, 10, "w".into(), Duration::from_secs(30)).await.unwrap();
     assert_eq!(later.trimmed().await.unwrap(), 0);
 }
+
+#[tokio::test]
+async fn a_queue_server_that_restarts_empty_is_read_again() {
+    let Some(url) = redis_queue_url() else {
+        eprintln!("skipped: ICHNOS_TEST_REDIS_QUEUE is not set");
+        return;
+    };
+    let shard = 46;
+    let mut conn = private_shard(&url, shard).await;
+    let queue =
+        RedisQueue::connect(&url, 48, 1_000, "w".into(), Duration::from_secs(30)).await.unwrap();
+
+    // What a restart without persistence leaves: no stream, no group. A
+    // publish makes the stream again, but not the group.
+    let _: () = redis::cmd("DEL").arg(format!("obs:{shard}")).query_async(&mut conn).await.unwrap();
+    let observation = test_observation();
+    queue.publish(&[(shard, observation.clone())]).await.unwrap();
+
+    let read = queue.read(shard, 100).await.unwrap();
+    assert_eq!(read.len(), 1, "the group is made again, from the start of the stream");
+    assert_eq!(read[0].observation, observation);
+    queue.ack(shard, &[read[0].id.clone()]).await.unwrap();
+    assert_eq!(pending_in_group(&mut conn, shard).await, 0);
+}
