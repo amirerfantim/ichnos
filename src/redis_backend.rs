@@ -188,7 +188,21 @@ pub struct RedisQueue {
     /// Entries already trimmed when this handle was opened, so a restart does
     /// not report the same loss twice.
     trimmed_at_open: u64,
+    /// How long publishing is refused after the server fails to answer.
+    publish_pause: Duration,
+    /// When this handle was made; `resume_at` counts from it.
+    epoch: Instant,
+    /// Nanoseconds after `epoch` until which publishing is refused.
+    resume_at: Arc<AtomicU64>,
 }
+
+/// How long publishing is refused after the queue server fails to answer.
+///
+/// A submit waits for its publish, and a client that submitted can do
+/// nothing about a queue that is down: it should get its answer at once and
+/// the loss be counted, rather than every submit waiting out its own timeout
+/// and the reconnects behind it.
+pub const PUBLISH_PAUSE: Duration = Duration::from_secs(1);
 
 impl RedisQueue {
     pub async fn connect(
@@ -198,20 +212,57 @@ impl RedisQueue {
         consumer: String,
         redeliver_after: std::time::Duration,
     ) -> Result<Self, String> {
+        let client = Client::open(url).map_err(|e| e.to_string())?;
+        // Give up on a server that does not take a connection quickly; a
+        // reply keeps the client's 500 ms.
+        let config = ConnectionManagerConfig::new()
+            .set_connection_timeout(Some(Duration::from_millis(200)))
+            .set_number_of_retries(1);
         let queue = Self {
-            conn: connect(url).await?,
+            conn: ConnectionManager::new_with_config(client, config)
+                .await
+                .map_err(|e| e.to_string())?,
             maxlen,
             group: "ichnos".into(),
             consumer,
             redeliver_after,
             shards,
             trimmed_at_open: 0,
+            publish_pause: PUBLISH_PAUSE,
+            epoch: Instant::now(),
+            resume_at: Arc::new(AtomicU64::new(0)),
         };
         for shard in 0..shards {
             queue.ensure_group(shard).await?;
         }
         let trimmed_at_open = queue.trimmed_ever().await.unwrap_or(0);
         Ok(Self { trimmed_at_open, ..queue })
+    }
+
+    /// This handle with another publish pause, for tests.
+    pub fn with_publish_pause(self, pause: Duration) -> Self {
+        Self { publish_pause: pause, ..self }
+    }
+
+    fn now(&self) -> u64 {
+        self.epoch.elapsed().as_nanos() as u64
+    }
+
+    /// The error for a failed publish. One the server did not answer pauses
+    /// publishing; a refusal is that publish's problem.
+    fn publish_failed(&self, error: redis::RedisError) -> QueueError {
+        if matches!(error.kind(), ErrorKind::Server(_) | ErrorKind::Extension) {
+            return QueueError::Failed(error.to_string());
+        }
+        let now = self.now();
+        let old = self.resume_at.load(Ordering::Relaxed);
+        if now >= old {
+            let until = now + self.publish_pause.as_nanos() as u64;
+            // Lost to a twin failure that set the same pause: nothing to do.
+            let _ =
+                self.resume_at.compare_exchange(old, until, Ordering::Relaxed, Ordering::Relaxed);
+        }
+        QueueError::Unavailable(error.to_string())
     }
 
     /// Where the count of entries deleted after being done is kept.
@@ -381,6 +432,9 @@ impl Queue for RedisQueue {
         if entries.is_empty() {
             return Ok(0);
         }
+        if self.now() < self.resume_at.load(Ordering::Relaxed) {
+            return Err(QueueError::Unavailable("paused: the server stopped answering".into()));
+        }
         let mut conn = self.conn.clone();
         let mut pipe = redis::pipe();
         let mut accepted = 0;
@@ -403,7 +457,7 @@ impl Queue for RedisQueue {
             accepted += 1;
         }
 
-        pipe.query_async::<()>(&mut conn).await.map_err(|e| QueueError::Failed(e.to_string()))?;
+        pipe.query_async::<()>(&mut conn).await.map_err(|e| self.publish_failed(e))?;
         Ok(accepted)
     }
 
