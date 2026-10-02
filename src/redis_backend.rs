@@ -15,11 +15,11 @@ use crate::ingest::queue::{Entry, Queue, QueueError};
 use crate::model::Observation;
 use crate::store::cache::CacheBackend;
 use async_trait::async_trait;
-use redis::aio::ConnectionManager;
-use redis::{AsyncCommands, Client};
+use redis::aio::{ConnectionManager, ConnectionManagerConfig};
+use redis::{AsyncCommands, Client, ErrorKind};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tracing::warn;
 
 /// Open a connection manager, which reconnects on its own after a drop.
@@ -30,26 +30,91 @@ async fn connect(url: &str) -> Result<ConnectionManager, String> {
 
 // ---------------------------------------------------------------- cache -----
 
+/// How long the cache is skipped after it fails to answer.
+pub const CACHE_PAUSE: Duration = Duration::from_secs(1);
+
 /// The cache backend. Every failure here is swallowed and counted: a request
 /// must never fail because a cache was unreachable.
+///
+/// Nor may it wait long on one. The cache only saves database reads, so it
+/// must never cost a caller more than it saves: a reply that takes longer
+/// than a cache reply ever should is a failure, and once the server fails to
+/// answer every command is skipped for [`CACHE_PAUSE`], so requests go
+/// straight to the database instead of each waiting out its own timeout.
+/// After the pause the next command tries again.
 #[derive(Clone)]
 pub struct RedisCache {
     conn: ConnectionManager,
     errors: Arc<AtomicU64>,
+    pause: Duration,
+    /// When this handle was made; `resume_at` counts from it.
+    epoch: Instant,
+    /// Nanoseconds after `epoch` until which commands are skipped.
+    resume_at: Arc<AtomicU64>,
 }
 
 impl RedisCache {
     pub async fn connect(url: &str) -> Result<Self, String> {
-        Ok(Self { conn: connect(url).await?, errors: Arc::new(AtomicU64::new(0)) })
+        Self::connect_with_pause(url, CACHE_PAUSE).await
+    }
+
+    /// [`connect`](Self::connect) with another pause, for tests.
+    pub async fn connect_with_pause(url: &str, pause: Duration) -> Result<Self, String> {
+        let client = Client::open(url).map_err(|e| e.to_string())?;
+        // A cache reply takes well under a millisecond.
+        let config = ConnectionManagerConfig::new()
+            .set_connection_timeout(Some(Duration::from_millis(200)))
+            .set_response_timeout(Some(Duration::from_millis(100)))
+            .set_number_of_retries(1);
+        let conn =
+            ConnectionManager::new_with_config(client, config).await.map_err(|e| e.to_string())?;
+        Ok(Self {
+            conn,
+            errors: Arc::new(AtomicU64::new(0)),
+            pause,
+            epoch: Instant::now(),
+            resume_at: Arc::new(AtomicU64::new(0)),
+        })
     }
 
     pub fn errors(&self) -> u64 {
         self.errors.load(Ordering::Relaxed)
     }
 
+    fn now(&self) -> u64 {
+        self.epoch.elapsed().as_nanos() as u64
+    }
+
+    /// Whether commands are being skipped.
+    fn paused(&self) -> bool {
+        self.now() < self.resume_at.load(Ordering::Relaxed)
+    }
+
+    /// Count and log a failed command. A refusal from the server is that
+    /// command's problem; anything else means the server did not answer,
+    /// and pauses the cache, logged once per pause.
     fn note(&self, what: &str, error: redis::RedisError) {
         self.errors.fetch_add(1, Ordering::Relaxed);
-        warn!(operation = what, error = %error, "cache operation failed; falling through");
+        if matches!(error.kind(), ErrorKind::Server(_) | ErrorKind::Extension) {
+            warn!(operation = what, error = %error, "cache operation failed; falling through");
+            return;
+        }
+        let now = self.now();
+        let old = self.resume_at.load(Ordering::Relaxed);
+        if now < old
+            || self
+                .resume_at
+                .compare_exchange(
+                    old,
+                    now + self.pause.as_nanos() as u64,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                )
+                .is_err()
+        {
+            return; // already paused, by this failure's twin
+        }
+        warn!(operation = what, pause = ?self.pause, error = %error, "cache unreachable; skipping it");
     }
 }
 
@@ -58,6 +123,9 @@ impl CacheBackend for RedisCache {
     async fn get_many(&self, keys: &[String]) -> Vec<Option<String>> {
         if keys.is_empty() {
             return vec![];
+        }
+        if self.paused() {
+            return vec![None; keys.len()];
         }
         let mut conn = self.conn.clone();
         // A single MGET, so one round trip covers every station in a request.
@@ -72,7 +140,7 @@ impl CacheBackend for RedisCache {
     }
 
     async fn set_many(&self, writes: &[(String, String, u64)]) {
-        if writes.is_empty() {
+        if writes.is_empty() || self.paused() {
             return;
         }
         let mut conn = self.conn.clone();
@@ -86,7 +154,7 @@ impl CacheBackend for RedisCache {
     }
 
     async fn delete_many(&self, keys: &[String]) {
-        if keys.is_empty() {
+        if keys.is_empty() || self.paused() {
             return;
         }
         let mut conn = self.conn.clone();
