@@ -756,33 +756,88 @@ fn as_string(value: &redis::Value) -> Option<String> {
 
 /// Daily request counters in Redis, so the allowance is shared across every
 /// pod rather than enforced separately by each one.
+///
+/// The counters live on the cache server, and a request whose count fails is
+/// allowed, so a count must never cost a caller more than the cache would:
+/// the cache's timeouts, [`CACHE_BUDGET`] in total, and once the server fails
+/// to answer, counting is skipped for [`CACHE_PAUSE`].
 #[derive(Clone)]
 pub struct RedisQuota {
     conn: ConnectionManager,
+    pause: Duration,
+    /// When this handle was made; `resume_at` counts from it.
+    epoch: Instant,
+    /// Nanoseconds after `epoch` until which counts are skipped.
+    resume_at: Arc<AtomicU64>,
 }
 
 impl RedisQuota {
     pub async fn connect(url: &str) -> Result<Self, String> {
-        Ok(Self { conn: connect(url).await? })
+        let client = Client::open(url).map_err(|e| e.to_string())?;
+        let config = ConnectionManagerConfig::new()
+            .set_connection_timeout(Some(Duration::from_millis(200)))
+            .set_response_timeout(Some(Duration::from_millis(100)))
+            .set_number_of_retries(1);
+        let conn =
+            ConnectionManager::new_with_config(client, config).await.map_err(|e| e.to_string())?;
+        Ok(Self {
+            conn,
+            pause: CACHE_PAUSE,
+            epoch: Instant::now(),
+            resume_at: Arc::new(AtomicU64::new(0)),
+        })
+    }
+
+    fn now(&self) -> u64 {
+        self.epoch.elapsed().as_nanos() as u64
+    }
+
+    /// Skip counting for the pause, logged once per pause.
+    fn pause_now(&self, error: &str) {
+        let now = self.now();
+        let old = self.resume_at.load(Ordering::Relaxed);
+        if now < old
+            || self
+                .resume_at
+                .compare_exchange(
+                    old,
+                    now + self.pause.as_nanos() as u64,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                )
+                .is_err()
+        {
+            return;
+        }
+        warn!(pause = ?self.pause, error, "quota count failed; allowing requests uncounted");
     }
 }
 
 #[async_trait]
 impl crate::api::quota::QuotaCounter for RedisQuota {
     async fn increment(&self, key: &str) -> Option<i64> {
+        if self.now() < self.resume_at.load(Ordering::Relaxed) {
+            return None;
+        }
         let mut conn = self.conn.clone();
         let counter = crate::api::quota::counter_key(key);
         // Increment and set the expiry together, so a counter cannot survive
         // past the day it belongs to if the second command were to be lost.
-        let (count,): (i64,) = redis::pipe()
-            .atomic()
-            .incr(&counter, 1)
-            .expire(&counter, 172_800)
-            .ignore()
-            .query_async(&mut conn)
-            .await
-            .ok()?;
-        Some(count)
+        let mut pipe = redis::pipe();
+        pipe.atomic().incr(&counter, 1).expire(&counter, 172_800).ignore();
+        match tokio::time::timeout(CACHE_BUDGET, pipe.query_async::<(i64,)>(&mut conn)).await {
+            Ok(Ok((count,))) => Some(count),
+            Ok(Err(e)) => {
+                if !matches!(e.kind(), ErrorKind::Server(_) | ErrorKind::Extension) {
+                    self.pause_now(&e.to_string());
+                }
+                None
+            }
+            Err(_) => {
+                self.pause_now("no answer within the call budget");
+                None
+            }
+        }
     }
 }
 
