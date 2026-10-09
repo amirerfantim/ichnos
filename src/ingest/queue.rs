@@ -32,6 +32,8 @@ pub type Result<T> = std::result::Result<T, QueueError>;
 pub struct Entry {
     pub id: String,
     pub observation: Observation,
+    /// When the entry joined the queue, in Unix milliseconds, if known.
+    pub queued_ms: Option<i64>,
 }
 
 #[async_trait]
@@ -193,7 +195,8 @@ impl Queue for MemoryQueue {
         for (shard, observation) in entries {
             let queue = &mut shards[*shard as usize];
             let id = self.next_id.fetch_add(1, Ordering::SeqCst).to_string();
-            queue.push_back(Entry { id, observation: observation.clone() });
+            let queued_ms = Some(chrono::Utc::now().timestamp_millis());
+            queue.push_back(Entry { id, observation: observation.clone(), queued_ms });
             // Drop from the front: the oldest history is the least missed,
             // because the same stations are reported again within seconds.
             while queue.len() > self.maxlen {

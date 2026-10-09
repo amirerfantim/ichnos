@@ -47,18 +47,35 @@ pub trait Leases: Send + Sync + 'static {
     /// worker would change nothing until the first one died.
     async fn heartbeat(&self, owner: &str, ttl: Duration) -> Result<()>;
 
-    /// How many workers have announced themselves recently.
-    async fn live_workers(&self, ttl: Duration) -> Result<usize>;
+    /// The workers that have announced themselves recently, sorted, so every
+    /// worker sees them in the same order.
+    async fn live_workers(&self, ttl: Duration) -> Result<Vec<String>>;
 }
 
-/// How many shards one worker should hold, given how many workers there are.
+/// How many shards the worker at `rank` should hold, among workers sorted
+/// alike everywhere.
 ///
-/// Rounded up, so every shard has an owner even when the division is uneven.
-/// A worker holding more than this releases the excess, which is what lets a
-/// new worker pick up work without waiting for an old one to die.
-pub fn fair_share(shards: u32, workers: usize) -> u32 {
+/// Every worker gets `shards / workers`, and the first `shards % workers` get
+/// one more, so the shares add up to exactly the shard count: every shard has
+/// an owner, and no worker sits idle while another holds two more than it. A
+/// worker holding more than its share releases the excess, which is what lets
+/// a new worker pick up work without waiting for an old one to die.
+///
+/// A rank outside the list (a worker whose own announcement has not landed
+/// yet) gets the rounded-up share, which can only make it hold more, never
+/// leave a shard without an owner.
+pub fn fair_share(shards: u32, workers: usize, rank: Option<usize>) -> u32 {
     let workers = workers.max(1) as u32;
-    shards.div_ceil(workers)
+    let (base, extra) = (shards / workers, shards % workers);
+    match rank {
+        Some(rank) if (rank as u32) < workers => base + u32::from((rank as u32) < extra),
+        _ => shards.div_ceil(workers),
+    }
+}
+
+/// Where `me` sits among the sorted live workers.
+pub fn rank(live: &[String], me: &str) -> Option<usize> {
+    live.iter().position(|w| w == me)
 }
 
 /// An in-process lease registry for tests and single-process runs.
@@ -151,11 +168,13 @@ impl Leases for MemoryLeases {
         Ok(())
     }
 
-    async fn live_workers(&self, _ttl: Duration) -> Result<usize> {
+    async fn live_workers(&self, _ttl: Duration) -> Result<Vec<String>> {
         let mut workers = self.workers.lock().expect("lease lock poisoned");
         let now = Instant::now();
         workers.retain(|_, until| *until > now);
-        Ok(workers.len())
+        let mut live: Vec<String> = workers.keys().cloned().collect();
+        live.sort();
+        Ok(live)
     }
 }
 
@@ -265,28 +284,43 @@ mod tests {
 
     #[tokio::test]
     async fn a_fair_share_covers_every_shard_even_when_it_divides_unevenly() {
-        assert_eq!(fair_share(8, 1), 8);
-        assert_eq!(fair_share(8, 2), 4);
-        assert_eq!(fair_share(8, 3), 3, "3 each covers 8 with one to spare");
-        assert_eq!(fair_share(8, 8), 1);
-        assert_eq!(fair_share(8, 20), 1, "more workers than shards is not an error");
-        assert_eq!(fair_share(8, 0), 8, "and nor is claiming to have none");
+        for (shards, workers, want) in [
+            (8, 1, vec![8]),
+            (8, 2, vec![4, 4]),
+            (8, 3, vec![3, 3, 2]),
+            (8, 5, vec![2, 2, 2, 1, 1]),
+            (32, 10, vec![4, 4, 3, 3, 3, 3, 3, 3, 3, 3]),
+            (2, 3, vec![1, 1, 0]),
+        ] {
+            let got: Vec<u32> =
+                (0..workers).map(|r| fair_share(shards, workers, Some(r))).collect();
+            assert_eq!(got, want, "{shards} shards, {workers} workers");
+            // Exactly the shard count: no shard without an owner, and no
+            // worker idle while another holds two more.
+            assert_eq!(got.iter().sum::<u32>(), shards);
+        }
+        assert_eq!(fair_share(8, 3, None), 3, "not yet listed: the rounded-up share");
+        assert_eq!(fair_share(8, 3, Some(5)), 3);
+        assert_eq!(fair_share(8, 0, None), 8, "and nor is claiming to have none");
+        let live = vec!["a".to_string(), "b".to_string()];
+        assert_eq!(rank(&live, "b"), Some(1));
+        assert_eq!(rank(&live, "z"), None);
     }
 
     #[tokio::test]
     async fn workers_are_counted_while_they_keep_announcing_themselves() {
         let leases = MemoryLeases::new();
-        assert_eq!(leases.live_workers(TTL).await.unwrap(), 0);
+        assert_eq!(leases.live_workers(TTL).await.unwrap().len(), 0);
 
         leases.heartbeat("a", TTL).await.unwrap();
         leases.heartbeat("b", TTL).await.unwrap();
-        assert_eq!(leases.live_workers(TTL).await.unwrap(), 2);
+        assert_eq!(leases.live_workers(TTL).await.unwrap().len(), 2);
 
         leases.heartbeat("a", TTL).await.unwrap();
-        assert_eq!(leases.live_workers(TTL).await.unwrap(), 2, "repeats do not double-count");
+        assert_eq!(leases.live_workers(TTL).await.unwrap().len(), 2, "repeats do not double-count");
 
         leases.forget_worker("b");
-        assert_eq!(leases.live_workers(TTL).await.unwrap(), 1);
+        assert_eq!(leases.live_workers(TTL).await.unwrap().len(), 1);
     }
 
     #[tokio::test]
@@ -294,7 +328,7 @@ mod tests {
         let leases = MemoryLeases::new();
         leases.heartbeat("gone", Duration::from_millis(1)).await.unwrap();
         tokio::time::sleep(Duration::from_millis(5)).await;
-        assert_eq!(leases.live_workers(TTL).await.unwrap(), 0);
+        assert_eq!(leases.live_workers(TTL).await.unwrap().len(), 0);
     }
 
     #[tokio::test]
