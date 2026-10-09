@@ -44,6 +44,10 @@ mod buckets {
     pub const BATCH_SECONDS: &[f64] = &[0.001, 0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0];
     /// How long an observation waited in the queue.
     pub const LAG_SECONDS: &[f64] = &[1.0, 5.0, 15.0, 30.0, 60.0, 120.0, 300.0, 600.0, 1800.0];
+    /// How late a report reaches the service: devices upload in batches, at
+    /// times days after the scan.
+    pub const REPORT_AGE_SECONDS: &[f64] =
+        &[1.0, 10.0, 60.0, 300.0, 1800.0, 3600.0, 21600.0, 86400.0, 259200.0, 604800.0];
 
     /// The accuracy of an answer we gave out.
     pub const ANSWER_METERS: &[f64] =
@@ -118,6 +122,7 @@ pub struct Metrics {
     pub queue_redelivered: IntCounter,
     /// How long the oldest observation in a drained batch had waited.
     pub queue_lag_seconds: Histogram,
+    pub report_age_seconds: Histogram,
 
     // ------------------------------------------------------------- worker ---
     pub station_writes: IntCounterVec,
@@ -329,8 +334,13 @@ impl Metrics {
             ),
             queue_lag_seconds: histogram(
                 "ichnos_queue_lag_seconds",
-                "Age of the oldest observation in a drained batch",
+                "Time the oldest entry in a drained batch waited in the queue",
                 buckets::LAG_SECONDS,
+            ),
+            report_age_seconds: histogram(
+                "ichnos_report_age_seconds",
+                "Age of the oldest report in a drained batch, from its scan: how late devices upload",
+                buckets::REPORT_AGE_SECONDS,
             ),
 
             station_writes: counter_vec(

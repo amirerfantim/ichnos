@@ -13,15 +13,15 @@ use crate::config::Config;
 use crate::geo::distance;
 use crate::ingest::elide::{self, Write};
 use crate::ingest::fold::{self, Action};
-use crate::ingest::lease::{fair_share, Leases};
+use crate::ingest::lease::{fair_share, rank, Leases};
 use crate::ingest::queue::{Entry, Queue};
 use crate::metrics::{self, Timer};
 use crate::model::{Station, StationKey};
-use crate::store::Store;
+use crate::store::{Store, StoreError};
 use chrono::Utc;
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::watch;
 use tracing::{debug, error, info, warn};
 
@@ -97,7 +97,7 @@ async fn drain_once<Q: Queue + ?Sized, S: Store + ?Sized>(
     let entries: Vec<Entry> = queue.read(shard, cfg.ingest.read_batch).await.map_err(|e| {
         m.worker_errors.with_label_values(&["queue_read"]).inc();
         m.queue_errors.with_label_values(&["read"]).inc();
-        WorkerError::Queue(e.to_string())
+        queue_error(e)
     })?;
 
     if entries.is_empty() {
@@ -105,10 +105,11 @@ async fn drain_once<Q: Queue + ?Sized, S: Store + ?Sized>(
     }
 
     let ids: Vec<String> = entries.iter().map(|e| e.id.clone()).collect();
+    record_queue_lag(&entries);
     let observations: Vec<_> = entries.into_iter().map(|e| e.observation).collect();
     let observation_count = observations.len();
     m.shard_batch_observations.observe(observation_count as f64);
-    record_queue_lag(&observations);
+    record_report_age(&observations);
 
     let grouped = fold::group(observations);
     let keys: Vec<StationKey> = grouped.keys().copied().collect();
@@ -120,7 +121,7 @@ async fn drain_once<Q: Queue + ?Sized, S: Store + ?Sized>(
         .await
         .map_err(|e| {
             m.worker_errors.with_label_values(&["store_read"]).inc();
-            WorkerError::Store(e.to_string())
+            store_error(e)
         })?
         .into_iter()
         .map(|s| (s.key, s))
@@ -179,7 +180,7 @@ async fn drain_once<Q: Queue + ?Sized, S: Store + ?Sized>(
         write.observe_on(&m.db_batch_seconds);
         result.map_err(|e| {
             m.worker_errors.with_label_values(&["store_write"]).inc();
-            WorkerError::Store(e.to_string())
+            store_error(e)
         })?;
     }
 
@@ -189,7 +190,7 @@ async fn drain_once<Q: Queue + ?Sized, S: Store + ?Sized>(
     queue.ack(shard, &ids).await.map_err(|e| {
         m.worker_errors.with_label_values(&["queue_ack"]).inc();
         m.queue_errors.with_label_values(&["ack"]).inc();
-        WorkerError::Queue(e.to_string())
+        queue_error(e)
     })?;
 
     let ratio = outcome.fold_ratio();
@@ -200,17 +201,49 @@ async fn drain_once<Q: Queue + ?Sized, S: Store + ?Sized>(
     Ok(outcome)
 }
 
-/// How long the oldest observation in this batch waited to be processed.
+/// How long the oldest entry in this batch waited in the queue.
 ///
 /// Depth says how much is waiting; this says how long it has been waiting,
 /// which is the number that tells you whether a backlog is actually hurting.
-fn record_queue_lag(observations: &[crate::model::Observation]) {
-    let Some(oldest) = observations.iter().map(|o| o.timestamp).min() else {
+fn record_queue_lag(entries: &[Entry]) {
+    let Some(oldest) = entries.iter().filter_map(|e| e.queued_ms).min() else {
         return;
     };
     let lag_ms = Utc::now().timestamp_millis() - oldest;
     if lag_ms > 0 {
         metrics::metrics().queue_lag_seconds.observe(lag_ms as f64 / 1000.0);
+    }
+}
+
+/// How old the oldest report in this batch is, counted from its scan.
+///
+/// It includes how late the device uploaded, which the queue has no part in.
+/// A report from the future records nothing.
+fn record_report_age(observations: &[crate::model::Observation]) {
+    let Some(oldest) = observations.iter().map(|o| o.timestamp).min() else {
+        return;
+    };
+    let age_ms = Utc::now().timestamp_millis() - oldest;
+    if age_ms > 0 {
+        metrics::metrics().report_age_seconds.observe(age_ms as f64 / 1000.0);
+    }
+}
+
+/// A queue failure, kept apart when the queue server is gone.
+fn queue_error(e: crate::ingest::queue::QueueError) -> WorkerError {
+    match e {
+        crate::ingest::queue::QueueError::Unavailable(m) => {
+            WorkerError::Unavailable(format!("queue: {m}"))
+        }
+        other => WorkerError::Queue(other.to_string()),
+    }
+}
+
+/// A store failure, kept apart when the database is gone.
+fn store_error(e: StoreError) -> WorkerError {
+    match e {
+        StoreError::Unavailable(m) => WorkerError::Unavailable(format!("store: {m}")),
+        other => WorkerError::Store(other.to_string()),
     }
 }
 
@@ -234,6 +267,10 @@ pub enum WorkerError {
     Store(String),
     #[error("leases: {0}")]
     Lease(String),
+    /// The database or the queue server is gone: every other shard would
+    /// only wait out the same timeout.
+    #[error("unavailable: {0}")]
+    Unavailable(String),
 }
 
 /// A running worker.
@@ -245,6 +282,9 @@ pub struct Worker<Q: Queue + ?Sized, S: Store + ?Sized, L: Leases + ?Sized> {
     /// Distinguishes this worker from its siblings in the lease registry.
     identity: String,
     held: HashSet<u32>,
+    /// When the leases were last renewed. A drain checks it between shards,
+    /// so a slow pass cannot outlive the leases it works under.
+    renewed: Option<Instant>,
 }
 
 impl<Q: Queue + ?Sized, S: Store + ?Sized, L: Leases + ?Sized> Worker<Q, S, L> {
@@ -255,7 +295,7 @@ impl<Q: Queue + ?Sized, S: Store + ?Sized, L: Leases + ?Sized> Worker<Q, S, L> {
         cfg: Config,
         identity: String,
     ) -> Self {
-        Self { queue, store, leases, cfg, identity, held: HashSet::new() }
+        Self { queue, store, leases, cfg, identity, held: HashSet::new(), renewed: None }
     }
 
     pub fn held_shards(&self) -> Vec<u32> {
@@ -266,15 +306,16 @@ impl<Q: Queue + ?Sized, S: Store + ?Sized, L: Leases + ?Sized> Worker<Q, S, L> {
 
     /// How many shards this worker should be holding right now.
     ///
-    /// An explicit limit wins. Otherwise it is an equal split across the
-    /// workers that have announced themselves, which is what lets a new worker
-    /// take up work without waiting for an old one to die.
+    /// An explicit limit wins. Otherwise it is an even split across the
+    /// workers that have announced themselves (see [`fair_share`]), which is
+    /// what lets a new worker take up work without waiting for an old one to
+    /// die.
     pub async fn target_shards(&self) -> Result<u32, WorkerError> {
         if self.cfg.lease.max_shards_per_worker > 0 {
             return Ok(self.cfg.lease.max_shards_per_worker);
         }
         let ttl = Duration::from_secs(self.cfg.lease.ttl_secs);
-        let workers = self.leases.live_workers(ttl).await.map_err(|e| {
+        let live = self.leases.live_workers(ttl).await.map_err(|e| {
             metrics::metrics().worker_errors.with_label_values(&["lease_count"]).inc();
             WorkerError::Lease(e.to_string())
         })?;
@@ -282,8 +323,8 @@ impl<Q: Queue + ?Sized, S: Store + ?Sized, L: Leases + ?Sized> Worker<Q, S, L> {
         // that knows how many siblings answered, and a worker that cannot see
         // its siblings takes every shard, which is worth being able to see.
         let m = metrics::metrics();
-        m.workers_live.set(workers as i64);
-        let share = fair_share(self.cfg.ingest.shards, workers);
+        m.workers_live.set(live.len() as i64);
+        let share = fair_share(self.cfg.ingest.shards, live.len(), rank(&live, &self.identity));
         m.leases_target.set(share as i64);
         Ok(share)
     }
@@ -375,6 +416,7 @@ impl<Q: Queue + ?Sized, S: Store + ?Sized, L: Leases + ?Sized> Worker<Q, S, L> {
                 }
             }
         }
+        self.renewed = Some(Instant::now());
         let m = metrics::metrics();
         m.lease_events.with_label_values(&["renewed"]).inc_by(renewed);
         // A lost lease means a sibling already owns the shard. It is the only
@@ -388,9 +430,24 @@ impl<Q: Queue + ?Sized, S: Store + ?Sized, L: Leases + ?Sized> Worker<Q, S, L> {
     }
 
     /// Drain every shard this worker holds, once.
-    pub async fn process_held(&self) -> ShardOutcome {
+    ///
+    /// Two things keep a slow pass from losing the leases it works under. The
+    /// leases are renewed between shards whenever a renewal is due, rather
+    /// than only from the run loop, which waits for the whole pass; and a pass
+    /// stops at the first shard that finds the database or the queue gone,
+    /// since every shard after it would only wait out the same timeout.
+    pub async fn process_held(&mut self) -> ShardOutcome {
+        let renew_every = Duration::from_secs(self.cfg.lease.renew_secs);
         let mut total = ShardOutcome::default();
-        for &shard in &self.held {
+        for shard in self.held_shards() {
+            if self.renewed.is_none_or(|at| at.elapsed() >= renew_every) {
+                if let Err(e) = self.renew_leases().await {
+                    error!(error = %e, "could not renew leases during a pass");
+                }
+            }
+            if !self.held.contains(&shard) {
+                continue; // lost while the pass ran: a sibling may own it now
+            }
             match process_shard(&*self.queue, &*self.store, shard, &self.cfg).await {
                 Ok(outcome) => {
                     total.observations += outcome.observations;
@@ -405,6 +462,10 @@ impl<Q: Queue + ?Sized, S: Store + ?Sized, L: Leases + ?Sized> Worker<Q, S, L> {
                     // not acknowledged, so it comes back.
                     metrics::metrics().worker_errors.with_label_values(&["shard"]).inc();
                     error!(shard, error = %e, "shard failed; its batch will be redelivered");
+                    if matches!(e, WorkerError::Unavailable(_)) {
+                        warn!("a backend is unavailable; ending this pass early");
+                        break;
+                    }
                 }
             }
         }
@@ -903,6 +964,30 @@ mod tests {
         let outcome = worker.process_held().await;
         assert_eq!(outcome.stations, 20, "every shard was drained");
         assert_eq!(outcome.written, 20);
+    }
+
+    #[tokio::test]
+    async fn a_pass_ends_at_the_first_shard_that_finds_the_database_gone() {
+        let cfg = cfg();
+        let queue = Arc::new(MemoryQueue::new(cfg.ingest.shards, 1_000));
+        let store = Arc::new(MemoryStore::new());
+        let mut worker = Worker::new(
+            queue.clone(),
+            store.clone(),
+            Arc::new(MemoryLeases::new()),
+            cfg.clone(),
+            "worker-a".into(),
+        );
+        worker.claim_shards().await.unwrap();
+        let observations: Vec<Observation> =
+            (1..=20).map(|i| observation(i, 35.7219, 51.3347)).collect();
+        publish(&queue, &cfg, observations).await;
+
+        store.set_failing(true);
+        worker.process_held().await;
+        let taken = (0..cfg.ingest.shards).filter(|&s| queue.pending_count(s) > 0).count();
+        assert_eq!(taken, 1, "every shard after the first would only wait out the same timeout");
+        assert_eq!(worker.held_shards().len() as u32, cfg.ingest.shards, "and the leases are kept");
     }
 
     #[tokio::test]

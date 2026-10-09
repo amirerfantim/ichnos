@@ -144,7 +144,12 @@ async fn observations(
 
     if !routed.is_empty() {
         let timer = Timer::start();
+        // A caller that gives up drops this handler mid-publish, and nothing
+        // after the await runs: the guard counts those observations as
+        // dropped, unless the publish finishes.
+        let guard = DroppedIfAbandoned(routed.len());
         let result = state.queue.publish(&routed).await;
+        std::mem::forget(guard);
         timer.observe_on(&m.queue_publish_seconds);
 
         match result {
@@ -170,6 +175,17 @@ async fn observations(
     }
 
     finish("observations", started, (StatusCode::OK, Json(serde_json::json!({}))).into_response())
+}
+
+/// Counts its observations as dropped when the handler holding it is dropped
+/// before the publish finishes, which is what happens when the caller gives
+/// up. Forgotten once the publish has an answer, which is counted as usual.
+struct DroppedIfAbandoned(usize);
+
+impl Drop for DroppedIfAbandoned {
+    fn drop(&mut self) {
+        metrics().observations.with_label_values(&["any", "dropped"]).inc_by(self.0 as u64);
+    }
 }
 
 /// Record what one kept observation looked like.

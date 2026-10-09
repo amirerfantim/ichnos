@@ -33,6 +33,12 @@ async fn connect(url: &str) -> Result<ConnectionManager, String> {
 /// How long the cache is skipped after it fails to answer.
 pub const CACHE_PAUSE: Duration = Duration::from_secs(1);
 
+/// The most one cache call may take, all in: connecting, retrying, sending
+/// and the reply. The timeouts below bound one attempt; when a server
+/// vanishes mid-flight, a call can also wait on the reconnect and its retry,
+/// past a 500 ms caller's deadline.
+pub const CACHE_BUDGET: Duration = Duration::from_millis(150);
+
 /// The cache backend. Every failure here is swallowed and counted: a request
 /// must never fail because a cache was unreachable.
 ///
@@ -99,6 +105,32 @@ impl RedisCache {
             warn!(operation = what, error = %error, "cache operation failed; falling through");
             return;
         }
+        self.pause_now(what, &error.to_string());
+    }
+
+    /// Run one cache call within [`CACHE_BUDGET`]. A call past it counts as
+    /// a server that did not answer.
+    async fn bounded<T>(
+        &self,
+        what: &str,
+        call: impl std::future::Future<Output = redis::RedisResult<T>>,
+    ) -> Option<T> {
+        match tokio::time::timeout(CACHE_BUDGET, call).await {
+            Ok(Ok(value)) => Some(value),
+            Ok(Err(e)) => {
+                self.note(what, e);
+                None
+            }
+            Err(_) => {
+                self.errors.fetch_add(1, Ordering::Relaxed);
+                self.pause_now(what, "no answer within the call budget");
+                None
+            }
+        }
+    }
+
+    /// Skip the cache for the pause, logged once per pause.
+    fn pause_now(&self, what: &str, error: &str) {
         let now = self.now();
         let old = self.resume_at.load(Ordering::Relaxed);
         if now < old
@@ -114,7 +146,7 @@ impl RedisCache {
         {
             return; // already paused, by this failure's twin
         }
-        warn!(operation = what, pause = ?self.pause, error = %error, "cache unreachable; skipping it");
+        warn!(operation = what, pause = ?self.pause, error, "cache unreachable; skipping it");
     }
 }
 
@@ -129,13 +161,9 @@ impl CacheBackend for RedisCache {
         }
         let mut conn = self.conn.clone();
         // A single MGET, so one round trip covers every station in a request.
-        match conn.mget::<_, Vec<Option<String>>>(keys).await {
-            Ok(values) if values.len() == keys.len() => values,
-            Ok(_) => vec![None; keys.len()],
-            Err(e) => {
-                self.note("mget", e);
-                vec![None; keys.len()]
-            }
+        match self.bounded("mget", conn.mget::<_, Vec<Option<String>>>(keys)).await {
+            Some(values) if values.len() == keys.len() => values,
+            _ => vec![None; keys.len()],
         }
     }
 
@@ -148,9 +176,7 @@ impl CacheBackend for RedisCache {
         for (key, value, ttl) in writes {
             pipe.set_ex(key, value, *ttl).ignore();
         }
-        if let Err(e) = pipe.query_async::<()>(&mut conn).await {
-            self.note("set", e);
-        }
+        self.bounded("set", pipe.query_async::<()>(&mut conn)).await;
     }
 
     async fn delete_many(&self, keys: &[String]) {
@@ -158,9 +184,7 @@ impl CacheBackend for RedisCache {
             return;
         }
         let mut conn = self.conn.clone();
-        if let Err(e) = conn.del::<_, ()>(keys).await {
-            self.note("del", e);
-        }
+        self.bounded("del", conn.del::<_, ()>(keys)).await;
     }
 
     async fn healthy(&self) -> bool {
@@ -194,7 +218,30 @@ pub struct RedisQueue {
     epoch: Instant,
     /// Nanoseconds after `epoch` until which publishing is refused.
     resume_at: Arc<AtomicU64>,
+    /// See [`CONSUMER_IDLE`] and [`PRUNE_EVERY`]; tests shorten them.
+    consumer_idle: Duration,
+    prune_every: Duration,
+    /// Per shard, nanoseconds after `epoch` until which a read does not prune.
+    next_prune: Arc<Vec<AtomicU64>>,
 }
+
+/// Every worker that ever read a shard stays in its group's consumer list,
+/// which grows with every restart. A read looks at most once per
+/// [`PRUNE_EVERY`] for consumers idle longer than [`CONSUMER_IDLE`] and holding
+/// no entries, and removes them. A live worker removed this way (one that has
+/// simply not read this shard for a while) is added back by its next read.
+pub const CONSUMER_IDLE: Duration = Duration::from_secs(3600);
+pub const PRUNE_EVERY: Duration = Duration::from_secs(600);
+
+/// Removes a consumer only if it holds no entries, checked and done in one
+/// step: removing a consumer forgets its pending entries, which would then
+/// never be redelivered.
+const DROP_CONSUMER_SCRIPT: &str = r#"
+if #redis.call('XPENDING', KEYS[1], ARGV[1], '-', '+', 1, ARGV[2]) == 0 then
+  return redis.call('XGROUP', 'DELCONSUMER', KEYS[1], ARGV[1], ARGV[2])
+end
+return -1
+"#;
 
 /// How long publishing is refused after the queue server fails to answer.
 ///
@@ -231,6 +278,9 @@ impl RedisQueue {
             publish_pause: PUBLISH_PAUSE,
             epoch: Instant::now(),
             resume_at: Arc::new(AtomicU64::new(0)),
+            consumer_idle: CONSUMER_IDLE,
+            prune_every: PRUNE_EVERY,
+            next_prune: Arc::new((0..shards).map(|_| AtomicU64::new(0)).collect()),
         };
         for shard in 0..shards {
             queue.ensure_group(shard).await?;
@@ -242,6 +292,63 @@ impl RedisQueue {
     /// This handle with another publish pause, for tests.
     pub fn with_publish_pause(self, pause: Duration) -> Self {
         Self { publish_pause: pause, ..self }
+    }
+
+    /// This handle with other consumer pruning limits, for tests.
+    pub fn with_pruning(self, consumer_idle: Duration, prune_every: Duration) -> Self {
+        Self { consumer_idle, prune_every, ..self }
+    }
+
+    /// Remove the shard's consumers that have gone quiet and hold nothing;
+    /// see [`CONSUMER_IDLE`]. Housekeeping: a failure is counted and the read
+    /// goes on.
+    async fn prune(&self, shard: u32) {
+        let now = self.now();
+        let next = &self.next_prune[shard as usize];
+        let old = next.load(Ordering::Relaxed);
+        if now < old
+            || next
+                .compare_exchange(
+                    old,
+                    now + self.prune_every.as_nanos() as u64,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                )
+                .is_err()
+        {
+            return;
+        }
+        let failed = || {
+            crate::metrics::metrics().queue_errors.with_label_values(&["prune"]).inc();
+        };
+        let mut conn = self.conn.clone();
+        let reply: redis::Value = match redis::cmd("XINFO")
+            .arg("CONSUMERS")
+            .arg(Self::stream(shard))
+            .arg(&self.group)
+            .query_async(&mut conn)
+            .await
+        {
+            Ok(reply) => reply,
+            Err(_) => return failed(),
+        };
+        let redis::Value::Array(consumers) = reply else { return };
+        let idle_ms = self.consumer_idle.as_millis() as i64;
+        for consumer in &consumers {
+            let Some((name, pending, idle)) = consumer_info(consumer) else { continue };
+            if name == self.consumer || pending > 0 || idle < idle_ms {
+                continue;
+            }
+            let removed = redis::Script::new(DROP_CONSUMER_SCRIPT)
+                .key(Self::stream(shard))
+                .arg(&self.group)
+                .arg(&name)
+                .invoke_async::<i64>(&mut conn)
+                .await;
+            if removed.is_err() {
+                return failed();
+            }
+        }
     }
 
     fn now(&self) -> u64 {
@@ -462,7 +569,11 @@ impl Queue for RedisQueue {
     }
 
     async fn read(&self, shard: u32, max: usize) -> Result<Vec<Entry>, QueueError> {
-        match self.read_group(shard, max).await {
+        let read = self.read_group(shard, max).await;
+        if read.is_ok() {
+            self.prune(shard).await;
+        }
+        match read {
             // The queue server lost its data, as one without persistence does
             // when it restarts: publishing made the stream again, but not the
             // group, and every read would fail until the worker restarted.
@@ -567,6 +678,38 @@ fn parse_stream_reply(reply: &redis::Value) -> (Vec<Entry>, Vec<String>) {
     out
 }
 
+/// A consumer's name, pending count and idle milliseconds, from one entry of
+/// `XINFO CONSUMERS` (a flat field/value list, or a map).
+fn consumer_info(consumer: &redis::Value) -> Option<(String, i64, i64)> {
+    let pairs: Vec<(&redis::Value, &redis::Value)> = match consumer {
+        redis::Value::Array(flat) => {
+            flat.chunks(2).filter_map(|p| Some((p.first()?, p.get(1)?))).collect()
+        }
+        redis::Value::Map(map) => map.iter().map(|p| (&p.0, &p.1)).collect(),
+        _ => return None,
+    };
+    let (mut name, mut pending, mut idle) = (None, None, None);
+    for (key, value) in pairs {
+        let number = || match value {
+            redis::Value::Int(n) => Some(*n),
+            other => as_string(other)?.parse().ok(),
+        };
+        match as_string(key).as_deref() {
+            Some("name") => name = as_string(value),
+            Some("pending") => pending = number(),
+            Some("idle") => idle = number(),
+            _ => {}
+        }
+    }
+    Some((name?, pending?, idle?))
+}
+
+/// When a stream entry was added: a stream id starts with the server's clock
+/// in milliseconds, whoever wrote the entry.
+fn id_time_ms(id: &str) -> Option<i64> {
+    id.split('-').next()?.parse().ok()
+}
+
 /// Decode a list of stream entries, each an id and a flat field/value list.
 ///
 /// An entry with no readable id cannot be acknowledged and is skipped. One
@@ -591,7 +734,10 @@ fn parse_entries(entries: &[redis::Value]) -> (Vec<Entry>, Vec<String>) {
             }
         }
         match observation {
-            Some(observation) => good.push(Entry { id, observation }),
+            Some(observation) => {
+                let queued_ms = id_time_ms(&id);
+                good.push(Entry { id, observation, queued_ms })
+            }
             None => bad.push(id),
         }
     }
@@ -747,22 +893,25 @@ impl Leases for RedisLeases {
         Ok(())
     }
 
-    async fn live_workers(&self, ttl: Duration) -> Result<usize, LeaseError> {
+    async fn live_workers(&self, ttl: Duration) -> Result<Vec<String>, LeaseError> {
         let mut conn = self.conn.clone();
         let cutoff = chrono::Utc::now().timestamp() - ttl.as_secs().max(1) as i64;
-        // Drop the ones that have gone quiet, then count what is left.
-        let (_, count): (i64, i64) = redis::pipe()
+        // Drop the ones that have gone quiet, then list what is left.
+        let (_, mut live): (i64, Vec<String>) = redis::pipe()
             .atomic()
             .cmd("ZREMRANGEBYSCORE")
             .arg(WORKERS_KEY)
             .arg("-inf")
             .arg(cutoff)
-            .cmd("ZCARD")
+            .cmd("ZRANGE")
             .arg(WORKERS_KEY)
+            .arg(0)
+            .arg(-1)
             .query_async(&mut conn)
             .await
             .map_err(|e| LeaseError::Unavailable(e.to_string()))?;
-        Ok(count.max(0) as usize)
+        live.sort();
+        Ok(live)
     }
 }
 
