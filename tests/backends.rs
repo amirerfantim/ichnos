@@ -477,7 +477,13 @@ async fn workers_can_count_one_another_through_redis() {
     leases.heartbeat(&me, ttl).await.unwrap();
     let after = leases.live_workers(ttl).await.unwrap();
 
-    assert!(after > before, "announcing should make this worker visible");
+    assert!(
+        !before.contains(&me) && after.contains(&me),
+        "announcing should make this worker visible"
+    );
+    let mut sorted = after.clone();
+    sorted.sort();
+    assert_eq!(after, sorted, "listed in order");
 }
 
 #[tokio::test]

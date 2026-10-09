@@ -174,6 +174,7 @@ async fn every_declared_metric_family_is_actually_written_by_some_code_path() {
         "ichnos_stream_fill_ratio",
         "ichnos_queue_publish_seconds",
         "ichnos_queue_lag_seconds",
+        "ichnos_report_age_seconds",
         // worker
         "ichnos_station_writes_total",
         "ichnos_elision_total",

@@ -165,7 +165,10 @@ async fn build_store(cfg: &Config, in_memory: bool) -> Result<Arc<dyn Store>> {
         Err(e) => {
             // A missing cache makes reads slower, not impossible, so it is not
             // worth refusing to start over.
-            warn!(error = %e, "no cache available; every read will reach the database");
+            warn!(
+                error = %e,
+                "cache server unreachable at start; using an in-process cache with no expiry until restart"
+            );
             Ok(Arc::new(CachedStore::new(store, MemoryCache::new(), cfg.cache.clone())))
         }
     }
