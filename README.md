@@ -30,8 +30,9 @@ POST /v1/locate         "These are the stations I can see. Where am I?"
 ## Why it exists
 
 Ichnaea was designed for volunteers walking around with phones. Its write path
-reads a station, blends in one observation, and writes it back, under a row
-lock, once per sighting.
+takes a batch of reports, groups them by station, and for each station reads
+the row under a lock, blends the batch in, and writes the whole row back,
+whether or not anything moved.
 
 That shape does not survive a fleet of vehicles reporting every twenty seconds.
 The same access point is seen thousands of times an hour, and each sighting
@@ -41,7 +42,7 @@ Ichnos keeps the algorithm and rebuilds the machine around it:
 
 | | Ichnaea | Ichnos |
 |---|---|---|
-| Write path | one read-modify-write per sighting, under a row lock | observations are folded per station, then written in one batch |
+| Write path | per batch, a locked read and a full write of every station mentioned | observations are folded per station, then only the stations that changed are written, in one batch |
 | Concurrency | `SELECT ... FOR UPDATE` | one worker owns a shard, so no locks at all |
 | Unchanged stations | rewritten anyway | not written at all |
 | Scheduling | a scheduler hands out work on a timer | workers claim shards themselves and rebalance |
@@ -111,9 +112,10 @@ Add `?explain=1` and the answer also carries the working: which stations were
 known, how they clustered, which cluster won and why. It costs nothing unless
 asked for.
 
-If the database is unreachable, the answer comes from cache alone and carries
-`X-Ichnos-Degraded: 1`, so a caller can tell "we do not know" from "we could not
-look".
+If the database is unreachable, a locate whose stations are all in the cache is
+answered as usual, with no extra header. A locate that needs even one station
+from the database gets `404` with `X-Ichnos-Degraded: 1`, so a caller can tell
+"we do not know" from "we could not look".
 
 ### `GET /debug/station/{wifi|cell}/{key}`
 
@@ -286,7 +288,9 @@ and **quality** says whether the answers are getting better or worse.
 `ichnos_start_time_seconds`.
 
 `ichnos_queue_lag_seconds` is the one to reach for during an incident. Depth
-says how much is waiting; lag says how long it has been waiting, which is what
+says how much is waiting; lag says how long the oldest entry of each drained
+batch waited in the queue (`ichnos_report_age_seconds` is the scan's age,
+which also holds how late devices upload), which is what
 decides whether a backlog is actually hurting.
 
 #### Behaviour
@@ -337,7 +341,7 @@ changing.
 | Cache Redis | Reads get slower. Nothing fails. |
 | Queue Redis | Learning pauses; answering is unaffected. Dropped observations are counted. |
 | One database node | Nothing visible, at a replication factor above one. |
-| The whole database | Answers come from cache with `X-Ichnos-Degraded`. Workers back off and retry. |
+| The whole database | Locates whose stations are all cached are answered; the rest get `404` with `X-Ichnos-Degraded`. A worker ends its pass at the first shard that finds the database gone and keeps its leases; the batch is taken again after the redelivery wait. |
 | A worker dies | Its lease expires, another takes the shard, and its unacknowledged batch is redelivered. |
 | A shard fills up | Oldest entries drop and are counted. A device re-reports the same stations within seconds, so the loss is history, not coverage. |
 | A bad deploy | Roll back, then rebuild by replaying recorded traffic. |
