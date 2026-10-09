@@ -18,6 +18,25 @@
 
 ### Fixed
 
+- **A slow database could cost a worker its leases.** A drain pass renews the
+  leases between shards when a renewal is due, skips a shard it lost, and
+  ends at the first shard that finds the database or the queue unavailable.
+- **Shards were shared unevenly.** With 32 shards and 10 workers, two workers
+  sat idle. Each worker now takes `shards / workers`, and the first
+  `shards % workers` by name take one more.
+- **A cache call could outlast a 500 ms caller** while the client reconnected
+  and retried. Every cache call now has a 150 ms limit in total.
+- **Stopped workers stayed in each stream's consumer list for ever.** A read
+  removes consumers idle for an hour that hold no entries, at most once
+  every ten minutes per shard, in one atomic step.
+- **A submit whose caller gave up lost its observations uncounted.** They are
+  now counted in `ichnos_observations_total{outcome="dropped"}`.
+- **`ichnos_queue_lag_seconds` measured the scan's age, not the wait in the
+  queue.** It now counts from the stream entry's time; the scan's age has its
+  own histogram, `ichnos_report_age_seconds`.
+- The log line when the cache server is unreachable at start says what
+  happens: an in-process cache with no expiry, until restart.
+
 - **A blocked station was still learned from.** The read path hid blocked
   stations, but the write path never checked: every report of a blocked
   station was folded in, so a station blocked for moving recovered a position
