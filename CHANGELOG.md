@@ -36,6 +36,10 @@
   own histogram, `ichnos_report_age_seconds`.
 - The log line when the cache server is unreachable at start says what
   happens: an in-process cache with no expiry, until restart.
+- **A daily-quota count could hold a request for seconds while the cache
+  server was down**: the counter kept the client's default timeouts and had
+  no pause. It now has the cache's limits: 150 ms in total per count, then
+  counting is skipped for a second; the request is allowed, as before.
 
 - **A blocked station was still learned from.** The read path hid blocked
   stations, but the write path never checked: every report of a blocked
