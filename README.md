@@ -210,34 +210,44 @@ is a constant in the code, and each default records which Ichnaea constant it
 came from, so any deviation is deliberate and traceable.
 
 ```bash
-ichnos --config config.toml serve
-ICHNOS__INGEST__SHARDS=64 ichnos serve     # environment overrides the file
-ichnos show-config                          # what the settings actually resolved to
+ichnos --config config.yaml serve
+ichnos serve                  # reads /etc/ichnos/config.yaml, else config/config.yaml
+ichnos show-config            # what the settings actually resolved to, and from where
 ```
 
-Some of the ones worth knowing:
+All settings live in one YAML file, one section per area, keys in camelCase.
+Nothing else is read: no environment variables, so the file is the whole
+truth about a deployment. `--config` names the file; without it, Ichnos reads
+`/etc/ichnos/config.yaml` (where a deployment mounts it), else
+`config/config.yaml`, else runs on the defaults. A key left out keeps its
+default, and an unknown key is an error, so a misspelling cannot pass quietly.
+`config/config.yaml` lists every key. Some of the ones worth knowing:
 
 | Key | Default | What it does |
 |---|---|---|
-| `locate.wifi.min_in_cluster` | `2` | Known stations needed before an answer is given |
-| `locate.wifi.max_cluster_meters` | `500` | How far apart stations may be and still agree |
+| `locate.wifi.minInCluster` | `2` | Known stations needed before an answer is given |
+| `locate.wifi.maxClusterMeters` | `500` | How far apart stations may be and still agree |
 | `ingest.shards` | `32` | Queue shards; one worker owns whole shards |
-| `ingest.fold_window_secs` | `45` | How long a worker collects before writing |
-| `ingest.stream_maxlen` | `200000` | Cap per shard, beyond which the oldest are dropped |
-| `elision.min_move_m` | `1.0` | Below this movement, an unchanged station is not rewritten |
-| `block.temporary_days` | `7` | How long a station stays blocked after moving |
-| `block.budget_days` | `10` | One forgiven block per this many days of known age |
-| `cache.miss_ttl_secs` | `60` | How long an unknown station stays cached as unknown |
-| `cql.ttl_days` | `180` | Row lifetime, refreshed by every write |
-| `api.locate_sample_percent` | `100` | Scales every key's learning from locates; 0 stops it |
+| `ingest.foldWindowSecs` | `45` | How long a worker collects before writing |
+| `ingest.streamMaxlen` | `200000` | Cap per shard, beyond which the oldest are dropped |
+| `elision.minMoveM` | `1.0` | Below this movement, an unchanged station is not rewritten |
+| `block.temporaryDays` | `7` | How long a station stays blocked after moving |
+| `block.budgetDays` | `10` | One forgiven block per this many days of known age |
+| `cache.missTtlSecs` | `60` | How long an unknown station stays cached as unknown |
+| `cql.ttlDays` | `180` | Row lifetime, refreshed by every write |
+| `api.locateSamplePercent` | `100` | Scales every key's learning from locates; 0 stops it |
+| `log.level` / `log.format` | `info` / `json` | `debug`, `info`, `warn` or `error`; `json` lines or `pretty` text, on stderr |
+| `worker.identity` | empty | A worker's name in the lease registry; empty uses the host name (the pod name) |
+| `cache.budgetMs` / `cache.pauseMs` | `150` / `1000` | The most one cache or quota call may take, and how long a silent cache is skipped |
+| `queue.publishPauseMs` | `1000` | After a failed publish, submits are answered at once for this long and the loss is counted |
 
-Run `ichnos show-config` for the full list with defaults.
+Run `ichnos show-config` for the full list with its values.
 
 > **On the block schedule.** Ichnaea's widely observed "45 day" recovery is not a
 > constant anywhere. It falls out of `block_count >= round(age_in_days / 30)`:
 > a station blocked once stays blocked until that rounds up to two, which lands
-> at 45 days. To make blocks shorter, change `block.budget_days`, not
-> `block.temporary_days`.
+> at 45 days. To make blocks shorter, change `block.budgetDays`, not
+> `block.temporaryDays`.
 
 ---
 
@@ -325,7 +335,7 @@ say whether the service is good at its job.
 | `ichnos_observation_weight`, `ichnos_observation_accuracy_meters`, `ichnos_observation_age_ms` | The shape of the incoming data. |
 
 The four per-observation histograms sit on the hottest path there is. Set
-`metrics.observation_detail = false` to switch them off once the weights stop
+`metrics.observationDetail: false` to switch them off once the weights stop
 changing.
 
 #### Latency

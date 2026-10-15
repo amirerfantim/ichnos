@@ -2,5 +2,5 @@
 **/*.rs.bk
 *.pdb
 .DS_Store
-/config/local.toml
+/config/local.yaml
 /.env

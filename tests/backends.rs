@@ -15,7 +15,7 @@
 //! opposite: they are slower and need a real server, and they are the only
 //! place the CQL and Redis code is actually exercised.
 
-use ichnos::config::{Cache as CacheCfg, Cql as CqlCfg};
+use ichnos::config::{Cache as CacheCfg, Cql as CqlCfg, QueueCfg};
 use ichnos::ingest::lease::Leases;
 use ichnos::ingest::queue::Queue;
 use ichnos::model::key::{CellKey, Radio, StationKind, WifiKey};
@@ -243,7 +243,8 @@ async fn the_redis_cache_stores_reads_and_forgets() {
         eprintln!("skipped: ICHNOS_TEST_REDIS is not set");
         return;
     };
-    let cache = RedisCache::connect(&url).await.expect("cache should connect");
+    let cache =
+        RedisCache::connect(&url, &CacheCfg::default()).await.expect("cache should connect");
     assert!(cache.healthy().await);
 
     let key = format!("test:{}", unique_mac().0);
@@ -263,7 +264,7 @@ async fn a_multi_key_cache_read_keeps_its_order() {
         eprintln!("skipped: ICHNOS_TEST_REDIS is not set");
         return;
     };
-    let cache = RedisCache::connect(&url).await.unwrap();
+    let cache = RedisCache::connect(&url, &CacheCfg::default()).await.unwrap();
     let base = unique_mac().0;
     let (a, b, c) = (format!("t:{base}:a"), format!("t:{base}:b"), format!("t:{base}:c"));
 
@@ -284,9 +285,16 @@ async fn the_redis_queue_carries_observations_and_holds_them_until_acknowledged(
         return;
     };
     let consumer = format!("test-{}", unique_mac().0);
-    let queue = RedisQueue::connect(&url, 4, 1_000, consumer, Duration::from_secs(30))
-        .await
-        .expect("queue should connect");
+    let queue = RedisQueue::connect(
+        &url,
+        4,
+        1_000,
+        consumer,
+        Duration::from_secs(30),
+        &QueueCfg::default(),
+    )
+    .await
+    .expect("queue should connect");
     assert!(queue.healthy().await);
 
     let shard = 3;
@@ -385,8 +393,12 @@ async fn a_batch_taken_by_a_dead_worker_is_redelivered_to_the_next_one() {
     let shard = 41;
     let mut conn = private_shard(&url, shard).await;
     let wait = Duration::from_millis(300);
-    let dead = RedisQueue::connect(&url, 48, 1_000, "dead".into(), wait).await.unwrap();
-    let next = RedisQueue::connect(&url, 48, 1_000, "next".into(), wait).await.unwrap();
+    let dead = RedisQueue::connect(&url, 48, 1_000, "dead".into(), wait, &QueueCfg::default())
+        .await
+        .unwrap();
+    let next = RedisQueue::connect(&url, 48, 1_000, "next".into(), wait, &QueueCfg::default())
+        .await
+        .unwrap();
 
     let observation = test_observation();
     dead.publish(&[(shard, observation.clone())]).await.unwrap();
@@ -414,7 +426,9 @@ async fn an_undecodable_entry_is_acknowledged_rather_than_redelivered_for_ever()
     let shard = 42;
     let mut conn = private_shard(&url, shard).await;
     let queue =
-        RedisQueue::connect(&url, 48, 1_000, "reader".into(), Duration::ZERO).await.unwrap();
+        RedisQueue::connect(&url, 48, 1_000, "reader".into(), Duration::ZERO, &QueueCfg::default())
+            .await
+            .unwrap();
 
     let _: String = redis::cmd("XADD")
         .arg(format!("obs:{shard}"))
@@ -493,7 +507,7 @@ async fn the_cached_store_reaches_the_real_database_once_and_then_stops() {
         return;
     };
     let Some(store) = cql_store().await else { return };
-    let cache = RedisCache::connect(&cache_url).await.unwrap();
+    let cache = RedisCache::connect(&cache_url, &CacheCfg::default()).await.unwrap();
     let cached = ichnos::store::cache::CachedStore::new(store, cache, CacheCfg::default());
 
     let key = StationKey::Wifi(unique_mac());
@@ -520,8 +534,16 @@ async fn finished_work_leaves_the_stream() {
     };
     let shard = 43;
     let mut conn = private_shard(&url, shard).await;
-    let queue =
-        RedisQueue::connect(&url, 48, 1_000, "w".into(), Duration::from_secs(30)).await.unwrap();
+    let queue = RedisQueue::connect(
+        &url,
+        48,
+        1_000,
+        "w".into(),
+        Duration::from_secs(30),
+        &QueueCfg::default(),
+    )
+    .await
+    .unwrap();
 
     let batch: Vec<(u32, Observation)> = (0..3).map(|_| (shard, test_observation())).collect();
     queue.publish(&batch).await.unwrap();
@@ -549,8 +571,16 @@ async fn finished_work_is_never_counted_as_lost() {
     let shard = 44;
     let url = private_db(&url, 11);
     let mut conn = private_shard(&url, shard).await;
-    let queue =
-        RedisQueue::connect(&url, 48, 10, "w".into(), Duration::from_secs(30)).await.unwrap();
+    let queue = RedisQueue::connect(
+        &url,
+        48,
+        10,
+        "w".into(),
+        Duration::from_secs(30),
+        &QueueCfg::default(),
+    )
+    .await
+    .unwrap();
     for _ in 0..50 {
         let batch: Vec<(u32, Observation)> = (0..10).map(|_| (shard, test_observation())).collect();
         queue.publish(&batch).await.unwrap();
@@ -571,8 +601,16 @@ async fn entries_dropped_unread_are_counted_exactly() {
     let shard = 45;
     let url = private_db(&url, 12);
     let mut conn = private_shard(&url, shard).await;
-    let queue =
-        RedisQueue::connect(&url, 48, 10, "w".into(), Duration::from_secs(30)).await.unwrap();
+    let queue = RedisQueue::connect(
+        &url,
+        48,
+        10,
+        "w".into(),
+        Duration::from_secs(30),
+        &QueueCfg::default(),
+    )
+    .await
+    .unwrap();
     // MAXLEN ~ trims whole nodes, so the exact count is whatever left the
     // stream: everything added less what is still there.
     let batch: Vec<(u32, Observation)> = (0..1_000).map(|_| (shard, test_observation())).collect();
@@ -582,8 +620,16 @@ async fn entries_dropped_unread_are_counted_exactly() {
     assert_eq!(queue.trimmed().await.unwrap(), 1_000 - left);
 
     // A handle opened now does not report that loss again.
-    let later =
-        RedisQueue::connect(&url, 48, 10, "w".into(), Duration::from_secs(30)).await.unwrap();
+    let later = RedisQueue::connect(
+        &url,
+        48,
+        10,
+        "w".into(),
+        Duration::from_secs(30),
+        &QueueCfg::default(),
+    )
+    .await
+    .unwrap();
     assert_eq!(later.trimmed().await.unwrap(), 0);
 }
 
@@ -595,8 +641,16 @@ async fn a_queue_server_that_restarts_empty_is_read_again() {
     };
     let shard = 46;
     let mut conn = private_shard(&url, shard).await;
-    let queue =
-        RedisQueue::connect(&url, 48, 1_000, "w".into(), Duration::from_secs(30)).await.unwrap();
+    let queue = RedisQueue::connect(
+        &url,
+        48,
+        1_000,
+        "w".into(),
+        Duration::from_secs(30),
+        &QueueCfg::default(),
+    )
+    .await
+    .unwrap();
 
     // What a restart without persistence leaves: no stream, no group. A
     // publish makes the stream again, but not the group.

@@ -6,11 +6,16 @@
 //! traceable.
 
 use serde::{Deserialize, Serialize};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+/// Where [`Config::find`] looks when no file is named: where a deployment
+/// mounts it, then the repository's own config for local runs.
+pub const DEFAULT_PATHS: [&str; 2] = ["/etc/ichnos/config.yaml", "config/config.yaml"];
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default, deny_unknown_fields, rename_all = "camelCase")]
 pub struct Config {
+    pub log: Log,
     pub server: Server,
     pub locate: Locate,
     pub validation: Validation,
@@ -22,14 +27,54 @@ pub struct Config {
     pub elision: Elision,
     pub spatial: Spatial,
     pub cache: Cache,
+    pub queue: QueueCfg,
     pub cql: Cql,
     pub redis: RedisCfg,
     pub api: Api,
     pub metrics: MetricsCfg,
+    pub worker: WorkerCfg,
+    pub import: Import,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default, deny_unknown_fields, rename_all = "camelCase")]
+pub struct Log {
+    /// `debug`, `info`, `warn` or `error`.
+    pub level: String,
+    /// `json`, one object per line for machines, or `pretty` for a terminal.
+    pub format: String,
+}
+
+impl Default for Log {
+    fn default() -> Self {
+        Self { level: "info".into(), format: "json".into() }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields, rename_all = "camelCase")]
+pub struct Import {
+    /// Stations per database write in `ichnos import`.
+    pub batch: usize,
+}
+
+impl Default for Import {
+    fn default() -> Self {
+        Self { batch: 1_000 }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields, rename_all = "camelCase")]
+pub struct WorkerCfg {
+    /// The name in the lease registry. Empty uses the host name, which in
+    /// Kubernetes is the pod name: every worker needs a name of its own, so
+    /// leave it empty in a Deployment.
+    pub identity: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields, rename_all = "camelCase")]
 pub struct Server {
     pub bind: String,
     /// Whole-request timeout. A locate that cannot answer quickly is worth less
@@ -43,15 +88,15 @@ impl Default for Server {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
-#[serde(default, deny_unknown_fields)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields, rename_all = "camelCase")]
 pub struct Locate {
     pub wifi: LocateNetwork,
     pub cell: LocateNetwork,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default, deny_unknown_fields, rename_all = "camelCase")]
 pub struct LocateNetwork {
     /// How far apart two stations may be and still count as one cluster.
     /// source: MAX_WIFI_CLUSTER_METERS
@@ -104,7 +149,7 @@ impl Default for LocateNetwork {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default, deny_unknown_fields, rename_all = "camelCase")]
 pub struct Validation {
     /// A scan older than this is dropped. source: MAX_OBSERVATION_AGE
     pub max_observation_age_ms: f64,
@@ -144,6 +189,9 @@ pub struct Validation {
     pub mcc_allowlist: Vec<i32>,
     /// Placeholder addresses that are never stored. source: WIFI_TEST_MAC
     pub invalid_macs: Vec<String>,
+    /// Report times outside this range, in Unix milliseconds, are not times
+    /// at all (2001 to 2286 by default), and the clock is used instead.
+    pub timestamp_ms: (i64, i64),
 }
 
 impl Default for Validation {
@@ -174,12 +222,13 @@ impl Default for Validation {
             mnc: (0, 999),
             mcc_allowlist: vec![],
             invalid_macs: vec!["000000000000".into(), "ffffffffffff".into(), "01005e901000".into()],
+            timestamp_ms: (1_000_000_000_000, 10_000_000_000_000),
         }
     }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default, deny_unknown_fields, rename_all = "camelCase")]
 pub struct StationCfg {
     /// Observations further apart than this make a batch inconsistent, which is
     /// what triggers the move check. source: WIFI_MAX_RADIUS
@@ -207,7 +256,7 @@ impl Default for StationCfg {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default, deny_unknown_fields, rename_all = "camelCase")]
 pub struct Block {
     /// Days a freshly blocked station stays blocked.
     /// source: TEMPORARY_BLOCKLIST_DURATION, which is 2 upstream.
@@ -224,7 +273,7 @@ impl Default for Block {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default, deny_unknown_fields, rename_all = "camelCase")]
 pub struct Score {
     /// Ceiling on the sample term. source: station_score_samples
     pub max_sample_score: f64,
@@ -241,7 +290,7 @@ impl Default for Score {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default, deny_unknown_fields, rename_all = "camelCase")]
 pub struct Ingest {
     /// Queue shards. One worker owns whole shards, which is what removes the
     /// need for row locks.
@@ -293,7 +342,7 @@ impl Default for Ingest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default, deny_unknown_fields, rename_all = "camelCase")]
 pub struct Lease {
     /// How long a shard lease survives a worker that has stopped renewing it.
     pub ttl_secs: u64,
@@ -310,7 +359,7 @@ impl Default for Lease {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default, deny_unknown_fields, rename_all = "camelCase")]
 pub struct Elision {
     /// Below this movement, with last_seen already today, nothing is written.
     pub min_move_m: f64,
@@ -326,7 +375,7 @@ impl Default for Elision {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default, deny_unknown_fields, rename_all = "camelCase")]
 pub struct Spatial {
     /// H3 resolution for the "what is known near here" index. Nine is about a
     /// 170 m cell, which is fine enough to be useful and coarse enough that a
@@ -341,7 +390,7 @@ impl Default for Spatial {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default, deny_unknown_fields, rename_all = "camelCase")]
 pub struct MetricsCfg {
     /// Sample queue depth in the background. Turning this off leaves the depth
     /// gauges empty, which costs the earliest warning the service has.
@@ -365,7 +414,7 @@ impl Default for MetricsCfg {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default, deny_unknown_fields, rename_all = "camelCase")]
 pub struct Cache {
     pub enabled: bool,
     /// How long a known station stays cached.
@@ -373,16 +422,80 @@ pub struct Cache {
     /// How long a key we have never seen stays cached as a negative. This is
     /// what stops unknown stations costing a database read every time.
     pub miss_ttl_secs: u64,
+    /// How long connecting to the cache server may take. The quota counters
+    /// live there too and use the same limits.
+    pub dial_timeout_ms: u64,
+    /// How long one reply may take. A cache reply takes well under a
+    /// millisecond.
+    pub read_timeout_ms: u64,
+    /// The most one cache call may take, all in: connecting, retrying,
+    /// sending and the reply. The timeouts above bound one attempt; when a
+    /// server vanishes mid-flight, a call can also wait on the reconnect and
+    /// its retry, past a short caller's deadline.
+    pub budget_ms: u64,
+    /// How long the cache is skipped after it fails to answer, so requests go
+    /// straight to the database instead of each waiting out its own timeout.
+    pub pause_ms: u64,
 }
 
 impl Default for Cache {
     fn default() -> Self {
-        Self { enabled: true, hit_ttl_secs: 300, miss_ttl_secs: 60 }
+        Self {
+            enabled: true,
+            hit_ttl_secs: 300,
+            miss_ttl_secs: 60,
+            dial_timeout_ms: 200,
+            read_timeout_ms: 100,
+            budget_ms: 150,
+            pause_ms: 1_000,
+        }
     }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default, deny_unknown_fields, rename_all = "camelCase")]
+pub struct QueueCfg {
+    /// How long connecting to the queue server may take.
+    pub dial_timeout_ms: u64,
+    /// How long one reply may take.
+    pub read_timeout_ms: u64,
+    /// Retries of a command after a dropped connection.
+    pub max_retries: usize,
+    /// How long publishing is refused after the queue server fails to
+    /// answer. A client that submitted can do nothing about a queue that is
+    /// down: it gets its answer at once and the loss is counted, rather than
+    /// every submit waiting out its own timeout.
+    pub publish_pause_ms: u64,
+    /// Every worker that ever read a shard stays in its group's consumer
+    /// list, which grows with every restart. A read looks at most once per
+    /// `pruneEverySecs` for consumers idle longer than this and holding no
+    /// entries, and removes them.
+    pub consumer_idle_secs: u64,
+    pub prune_every_secs: u64,
+    /// Calls taking back stuck entries in one read.
+    pub max_reclaim_calls: usize,
+    /// Entries per acknowledgement. At most 7000: Lua unpacks at most about
+    /// 8000 arguments.
+    pub ack_chunk: usize,
+}
+
+impl Default for QueueCfg {
+    fn default() -> Self {
+        Self {
+            dial_timeout_ms: 200,
+            read_timeout_ms: 500,
+            max_retries: 1,
+            publish_pause_ms: 1_000,
+            consumer_idle_secs: 3_600,
+            prune_every_secs: 600,
+            max_reclaim_calls: 8,
+            ack_chunk: 1_000,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields, rename_all = "camelCase")]
 pub struct Cql {
     pub nodes: Vec<String>,
     pub keyspace: String,
@@ -429,7 +542,7 @@ impl Default for Cql {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default, deny_unknown_fields, rename_all = "camelCase")]
 pub struct RedisCfg {
     /// Cache instance. Losing entries here is free, so it may run an eviction
     /// policy.
@@ -451,7 +564,7 @@ impl Default for RedisCfg {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default, deny_unknown_fields, rename_all = "camelCase")]
 pub struct Api {
     /// Networks accepted per request. Beyond this the extras are ignored.
     pub max_networks: usize,
@@ -470,6 +583,9 @@ pub struct Api {
     /// shed the learning from locates when the write path is behind.
     /// source: global_locate_sample_rate
     pub locate_sample_percent: f64,
+    /// How long a daily quota counter lives. More than a day, so a counter
+    /// cannot expire before its day ends.
+    pub quota_keep_hours: u64,
 }
 
 impl Default for Api {
@@ -482,47 +598,68 @@ impl Default for Api {
             key_cache_secs: 60,
             require_keys: true,
             locate_sample_percent: 100.0,
+            quota_keep_hours: 48,
         }
     }
 }
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
+    /// A file that could not be read at all: missing, broken YAML, an unknown
+    /// key, or a value of the wrong type.
     #[error("failed to load configuration: {0}")]
-    Load(#[from] config::ConfigError),
+    Load(String),
     #[error("invalid configuration: {0}")]
     Invalid(String),
 }
 
 impl Config {
-    /// Load defaults, then an optional file, then `ICHNOS__` environment
-    /// overrides (`ICHNOS__CQL__KEYSPACE=x`), then validate.
-    pub fn load(path: Option<&Path>) -> Result<Self, ConfigError> {
-        let mut builder = config::Config::builder();
-
-        // Serialising the defaults first means a partial file only overrides
-        // what it mentions, rather than blanking whole sections.
-        let defaults = Config { locate: Locate::default_pair(), ..Default::default() };
-        let defaults_toml =
-            toml::to_string(&defaults).map_err(|e| ConfigError::Invalid(e.to_string()))?;
-        builder =
-            builder.add_source(config::File::from_str(&defaults_toml, config::FileFormat::Toml));
-
+    /// The file to read: `path` if one is named, else the first of
+    /// [`DEFAULT_PATHS`] that exists, else none, for the defaults alone.
+    pub fn find(path: Option<&Path>) -> Option<PathBuf> {
         if let Some(p) = path {
-            builder = builder.add_source(config::File::from(p).required(true));
+            return Some(p.to_path_buf());
         }
-        builder = builder.add_source(
-            config::Environment::with_prefix("ICHNOS").separator("__").try_parsing(true),
-        );
+        DEFAULT_PATHS.iter().map(PathBuf::from).find(|p| p.exists())
+    }
 
-        let cfg: Config = builder.build()?.try_deserialize()?;
+    /// Read the file at `path` over the defaults, then validate. No path is
+    /// the defaults alone. Nothing is read from the environment, so the file
+    /// is the whole truth about a deployment.
+    pub fn load(path: Option<&Path>) -> Result<Self, ConfigError> {
+        let mut cfg = Self::default();
+        if let Some(p) = path {
+            let raw = std::fs::read_to_string(p)
+                .map_err(|e| ConfigError::Load(format!("{}: {e}", p.display())))?;
+            cfg = Self::from_yaml(&raw)
+                .map_err(|e| ConfigError::Load(format!("{}: {e}", p.display())))?;
+        }
         cfg.validate()?;
         Ok(cfg)
     }
 
-    /// Defaults with no file and no environment, for tests.
+    /// Decode a document over the defaults, refusing keys the service does not
+    /// have. A misspelt key is almost always a setting someone believes is in
+    /// effect, and silently ignoring it is how that belief survives for months.
+    ///
+    /// A file only needs the values it changes: it is laid over the defaults
+    /// one mapping at a time, so anything it does not mention keeps its
+    /// default, down to a single field of a nested section.
+    pub fn from_yaml(raw: &str) -> Result<Self, String> {
+        let file: serde_yaml_ng::Value = serde_yaml_ng::from_str(raw).map_err(|e| e.to_string())?;
+        let mut merged = serde_yaml_ng::to_value(Self::default()).map_err(|e| e.to_string())?;
+        overlay(&mut merged, file);
+        serde_yaml_ng::from_value(merged).map_err(|e| e.to_string())
+    }
+
+    /// The configuration as YAML, as `ichnos show-config` prints it.
+    pub fn to_yaml(&self) -> Result<String, String> {
+        serde_yaml_ng::to_string(self).map_err(|e| e.to_string())
+    }
+
+    /// Defaults with no file, for tests.
     pub fn for_tests() -> Self {
-        Config { locate: Locate::default_pair(), ..Default::default() }
+        Self::default()
     }
 
     /// Reject combinations that look healthy from outside but cannot work.
@@ -535,58 +672,58 @@ impl Config {
         }
         if !(0.0..=100.0).contains(&self.api.locate_sample_percent) {
             return bad(format!(
-                "api.locate_sample_percent ({}) must be between 0 and 100",
+                "api.locateSamplePercent ({}) must be between 0 and 100",
                 self.api.locate_sample_percent
             ));
         }
         if self.ingest.fold_window_secs == 0 {
-            return bad("ingest.fold_window_secs must be at least 1".into());
+            return bad("ingest.foldWindowSecs must be at least 1".into());
         }
         if self.ingest.stream_maxlen == 0 {
-            return bad("ingest.stream_maxlen must be at least 1".into());
+            return bad("ingest.streamMaxlen must be at least 1".into());
         }
         if self.ingest.read_batch == 0 {
-            return bad("ingest.read_batch must be at least 1".into());
+            return bad("ingest.readBatch must be at least 1".into());
         }
         if self.ingest.max_drain_batches == 0 {
             return bad(
-                "ingest.max_drain_batches of 0 would stop the worker draining anything".into()
+                "ingest.maxDrainBatches of 0 would stop the worker draining anything".into()
             );
         }
         if self.lease.renew_secs == 0 || self.lease.renew_secs >= self.lease.ttl_secs {
             return bad(format!(
-                "lease.renew_secs ({}) must be below lease.ttl_secs ({}), or a lease expires \
+                "lease.renewSecs ({}) must be below lease.ttlSecs ({}), or a lease expires \
                  while its owner still believes it holds the shard",
                 self.lease.renew_secs, self.lease.ttl_secs
             ));
         }
         if self.ingest.redeliver_after_secs < self.lease.ttl_secs {
             return bad(format!(
-                "ingest.redeliver_after_secs ({}) must be at least lease.ttl_secs ({}), or a \
+                "ingest.redeliverAfterSecs ({}) must be at least lease.ttlSecs ({}), or a \
                  batch can be taken from a worker that still owns its shard",
                 self.ingest.redeliver_after_secs, self.lease.ttl_secs
             ));
         }
         if self.metrics.poll_enabled && self.metrics.poll_secs == 0 {
-            return bad("metrics.poll_secs must be at least 1 when polling is on".into());
+            return bad("metrics.pollSecs must be at least 1 when polling is on".into());
         }
         if self.cql.nodes.is_empty() {
             return bad("cql.nodes must list at least one node".into());
         }
         if self.cql.ttl_days == 0 {
             return bad(
-                "cql.ttl_days of 0 would write rows that never expire, which silently disables \
+                "cql.ttlDays of 0 would write rows that never expire, which silently disables \
                  the only thing bounding the dataset"
                     .into(),
             );
         }
         for (name, n) in [("wifi", &self.locate.wifi), ("cell", &self.locate.cell)] {
             if n.min_in_cluster == 0 {
-                return bad(format!("locate.{name}.min_in_cluster must be at least 1"));
+                return bad(format!("locate.{name}.minInCluster must be at least 1"));
             }
             if n.max_in_cluster < n.min_in_cluster {
                 return bad(format!(
-                    "locate.{name}.max_in_cluster ({}) is below min_in_cluster ({})",
+                    "locate.{name}.maxInCluster ({}) is below minInCluster ({})",
                     n.max_in_cluster, n.min_in_cluster
                 ));
             }
@@ -594,20 +731,61 @@ impl Config {
                 return bad(format!("locate.{name} accuracy bounds are not a valid range"));
             }
             if n.max_cluster_meters <= 0.0 {
-                return bad(format!("locate.{name}.max_cluster_meters must be positive"));
+                return bad(format!("locate.{name}.maxClusterMeters must be positive"));
             }
         }
         if self.block.budget_days <= 0.0 {
-            return bad("block.budget_days must be positive".into());
+            return bad("block.budgetDays must be positive".into());
         }
         if self.score.min_sample_score > self.score.max_sample_score {
-            return bad("score.min_sample_score is above score.max_sample_score".into());
+            return bad("score.minSampleScore is above score.maxSampleScore".into());
         }
         if self.spatial.h3_resolution > 15 {
-            return bad("spatial.h3_resolution must be 15 or less".into());
+            return bad("spatial.h3Resolution must be 15 or less".into());
         }
         if self.api.max_networks == 0 {
-            return bad("api.max_networks must be at least 1".into());
+            return bad("api.maxNetworks must be at least 1".into());
+        }
+        if !["debug", "info", "warn", "error"].contains(&self.log.level.as_str()) {
+            return bad(format!(
+                "log.level ({:?}) must be debug, info, warn or error",
+                self.log.level
+            ));
+        }
+        if !["json", "pretty"].contains(&self.log.format.as_str()) {
+            return bad(format!("log.format ({:?}) must be json or pretty", self.log.format));
+        }
+        if self.cache.dial_timeout_ms == 0 || self.cache.read_timeout_ms == 0 {
+            return bad("cache.dialTimeoutMs and readTimeoutMs must be at least 1".into());
+        }
+        if self.cache.budget_ms == 0 {
+            return bad("cache.budgetMs must be at least 1".into());
+        }
+        if self.queue.dial_timeout_ms == 0 || self.queue.read_timeout_ms == 0 {
+            return bad("queue.dialTimeoutMs and readTimeoutMs must be at least 1".into());
+        }
+        if self.queue.max_reclaim_calls == 0 {
+            return bad("queue.maxReclaimCalls must be at least 1".into());
+        }
+        if !(1..=7_000).contains(&self.queue.ack_chunk) {
+            return bad(
+                "queue.ackChunk must be between 1 and 7000: Lua unpacks at most about 8000 \
+                 arguments"
+                    .into(),
+            );
+        }
+        if self.api.quota_keep_hours <= 24 {
+            return bad(
+                "api.quotaKeepHours must be more than 24, or a counter can expire before its \
+                 day ends"
+                    .into(),
+            );
+        }
+        if self.import.batch == 0 {
+            return bad("import.batch must be at least 1".into());
+        }
+        if self.validation.timestamp_ms.0 > self.validation.timestamp_ms.1 {
+            return bad("validation.timestampMs is not a valid range".into());
         }
         Ok(())
     }
@@ -619,10 +797,36 @@ impl Config {
 }
 
 impl Locate {
-    /// WiFi and cell defaults differ, so `Default` alone would give cell the
-    /// WiFi numbers.
+    /// WiFi and cell defaults differ, so `LocateNetwork::default` alone would
+    /// give cell the WiFi numbers.
     pub fn default_pair() -> Self {
         Self { wifi: LocateNetwork::wifi_defaults(), cell: LocateNetwork::cell_defaults() }
+    }
+}
+
+impl Default for Locate {
+    fn default() -> Self {
+        Self::default_pair()
+    }
+}
+
+/// Lay `top` over `base`: mappings merge key by key, anything else replaces.
+/// An empty document (null) changes nothing.
+fn overlay(base: &mut serde_yaml_ng::Value, top: serde_yaml_ng::Value) {
+    use serde_yaml_ng::Value;
+    match (base, top) {
+        (_, Value::Null) => {}
+        (Value::Mapping(b), Value::Mapping(t)) => {
+            for (k, v) in t {
+                match b.get_mut(&k) {
+                    Some(slot) if v.is_mapping() => overlay(slot, v),
+                    _ => {
+                        b.insert(k, v);
+                    }
+                }
+            }
+        }
+        (b, t) => *b = t,
     }
 }
 
@@ -721,26 +925,188 @@ mod tests {
         assert_eq!(c.ttl_secs(), 15_552_000);
     }
 
-    #[test]
-    fn a_partial_file_only_overrides_what_it_mentions() {
-        let dir = std::env::temp_dir().join(format!("ichnos-cfg-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("partial.toml");
-        std::fs::write(&path, "[ingest]\nshards = 8\n").unwrap();
+    /// A file in a directory of its own, removed when dropped.
+    struct TempFile {
+        dir: PathBuf,
+        path: PathBuf,
+    }
 
-        let cfg = Config::load(Some(&path)).unwrap();
-        assert_eq!(cfg.ingest.shards, 8, "the file's value should win");
-        assert_eq!(cfg.ingest.fold_window_secs, 45, "unmentioned values keep their default");
-        assert_eq!(cfg.locate.cell.max_accuracy_m, 50_000.0);
+    impl TempFile {
+        fn new(name: &str, body: &str) -> Self {
+            let dir =
+                std::env::temp_dir().join(format!("ichnos-cfg-{}-{name}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("config.yaml");
+            std::fs::write(&path, body).unwrap();
+            Self { dir, path }
+        }
+    }
 
-        std::fs::remove_dir_all(&dir).ok();
+    impl Drop for TempFile {
+        fn drop(&mut self) {
+            std::fs::remove_dir_all(&self.dir).ok();
+        }
     }
 
     #[test]
-    fn config_round_trips_through_toml() {
-        let cfg = Config::for_tests();
-        let text = toml::to_string(&cfg).unwrap();
-        let back: Config = toml::from_str(&text).unwrap();
-        assert_eq!(cfg, back);
+    fn a_partial_file_only_overrides_what_it_mentions() {
+        let f = TempFile::new(
+            "partial",
+            "ingest:\n  shards: 8\nlocate:\n  cell:\n    minInCluster: 3\n",
+        );
+        let cfg = Config::load(Some(&f.path)).unwrap();
+        assert_eq!(cfg.ingest.shards, 8, "the file's value should win");
+        assert_eq!(cfg.ingest.fold_window_secs, 45, "unmentioned values keep their default");
+        assert_eq!(cfg.locate.cell.min_in_cluster, 3);
+        assert_eq!(
+            cfg.locate.cell.max_accuracy_m, 50_000.0,
+            "a field left out of a nested section keeps the cell default, not the WiFi one"
+        );
+        assert_eq!(cfg.locate.wifi, LocateNetwork::wifi_defaults());
+    }
+
+    #[test]
+    fn keys_are_camel_case() {
+        let cfg = Config::from_yaml("ingest:\n  foldWindowSecs: 1\nlog:\n  level: warn\n").unwrap();
+        assert_eq!(cfg.ingest.fold_window_secs, 1);
+        assert_eq!(cfg.log.level, "warn");
+        assert!(Config::from_yaml("ingest:\n  fold_window_secs: 1\n").is_err());
+    }
+
+    #[test]
+    fn an_unknown_key_is_refused() {
+        for doc in ["ingest:\n  shardz: 8\n", "nosuch:\n  x: 1\n", "elision:\n  enabled: maybe\n"] {
+            assert!(Config::from_yaml(doc).is_err(), "{doc}");
+        }
+        let f = TempFile::new("unknown", "ingest:\n  shardz: 8\n");
+        assert!(matches!(Config::load(Some(&f.path)), Err(ConfigError::Load(_))));
+    }
+
+    #[test]
+    fn an_empty_file_is_the_defaults() {
+        assert_eq!(Config::from_yaml("").unwrap(), Config::default());
+        assert_eq!(Config::from_yaml("# nothing\n").unwrap(), Config::default());
+    }
+
+    #[test]
+    fn a_missing_file_is_an_error() {
+        let path = std::env::temp_dir().join("ichnos-cfg-does-not-exist.yaml");
+        assert!(matches!(Config::load(Some(&path)), Err(ConfigError::Load(_))));
+    }
+
+    #[test]
+    fn an_invalid_file_fails_validation() {
+        let f = TempFile::new("invalid", "ingest:\n  shards: 0\n");
+        assert!(matches!(Config::load(Some(&f.path)), Err(ConfigError::Invalid(_))));
+    }
+
+    #[test]
+    fn the_environment_is_not_read() {
+        // Not set: a test must not change the environment of the others. A
+        // load with no file is exactly the defaults, whatever is set.
+        assert_eq!(Config::load(None).unwrap(), Config::default());
+    }
+
+    #[test]
+    fn find_prefers_the_named_file() {
+        let named = Path::new("/somewhere/else.yaml");
+        assert_eq!(Config::find(Some(named)), Some(named.to_path_buf()));
+    }
+
+    #[test]
+    fn a_bad_log_setting_is_rejected() {
+        for (level, format) in [("loud", "json"), ("info", "xml"), ("", "json")] {
+            let mut c = Config::for_tests();
+            c.log.level = level.into();
+            c.log.format = format.into();
+            assert!(c.validate().is_err(), "{level} {format}");
+        }
+        let mut c = Config::for_tests();
+        c.log.level = "debug".into();
+        c.log.format = "pretty".into();
+        c.validate().unwrap();
+    }
+
+    #[test]
+    fn a_bad_limit_is_rejected() {
+        let cases: [fn(&mut Config); 10] = [
+            |c| c.cache.dial_timeout_ms = 0,
+            |c| c.cache.read_timeout_ms = 0,
+            |c| c.cache.budget_ms = 0,
+            |c| c.queue.read_timeout_ms = 0,
+            |c| c.queue.max_reclaim_calls = 0,
+            |c| c.queue.ack_chunk = 0,
+            |c| c.queue.ack_chunk = 7_001,
+            |c| c.api.quota_keep_hours = 24,
+            |c| c.import.batch = 0,
+            |c| c.validation.timestamp_ms = (2, 1),
+        ];
+        for (i, set) in cases.iter().enumerate() {
+            let mut c = Config::for_tests();
+            set(&mut c);
+            assert!(c.validate().is_err(), "case {i}");
+        }
+        let mut c = Config::for_tests();
+        c.queue.ack_chunk = 7_000;
+        c.api.quota_keep_hours = 25;
+        c.validation.timestamp_ms = (5, 5);
+        c.queue.max_retries = 0;
+        c.cache.pause_ms = 0;
+        c.validate().unwrap();
+    }
+
+    #[test]
+    fn the_limits_keep_their_old_values() {
+        let c = Config::for_tests();
+        assert_eq!((c.cache.dial_timeout_ms, c.cache.read_timeout_ms), (200, 100));
+        assert_eq!((c.cache.budget_ms, c.cache.pause_ms), (150, 1_000));
+        assert_eq!(
+            (c.queue.dial_timeout_ms, c.queue.read_timeout_ms, c.queue.max_retries),
+            (200, 500, 1)
+        );
+        assert_eq!(c.queue.publish_pause_ms, 1_000);
+        assert_eq!((c.queue.consumer_idle_secs, c.queue.prune_every_secs), (3_600, 600));
+        assert_eq!((c.queue.max_reclaim_calls, c.queue.ack_chunk), (8, 1_000));
+        assert_eq!(c.api.quota_keep_hours, 48);
+        assert_eq!(c.import.batch, 1_000);
+        assert_eq!(c.validation.timestamp_ms, (1_000_000_000_000, 10_000_000_000_000));
+    }
+
+    #[test]
+    fn config_round_trips_through_yaml() {
+        let mut cfg = Config::for_tests();
+        cfg.cql.address_map.insert("10.0.0.5:9042".into(), "127.0.0.1:9042".into());
+        cfg.validation.mcc_allowlist = vec![432];
+        let text = cfg.to_yaml().unwrap();
+        assert_eq!(Config::from_yaml(&text).unwrap(), cfg);
+    }
+
+    #[test]
+    fn the_example_file_loads_and_is_complete() {
+        // Every key, so a reader sees every setting in one place.
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("config/config.yaml");
+        let raw = std::fs::read_to_string(&path).unwrap();
+        Config::load(Some(&path)).unwrap();
+        let file: serde_yaml_ng::Value = serde_yaml_ng::from_str(&raw).unwrap();
+        let all = serde_yaml_ng::to_value(Config::default()).unwrap();
+        let mut missing = vec![];
+        keys_missing("", &all, &file, &mut missing);
+        assert!(missing.is_empty(), "config/config.yaml lacks {missing:?}");
+    }
+
+    fn keys_missing(
+        prefix: &str,
+        all: &serde_yaml_ng::Value,
+        file: &serde_yaml_ng::Value,
+        out: &mut Vec<String>,
+    ) {
+        let Some(map) = all.as_mapping() else { return };
+        for (k, v) in map {
+            let name = format!("{prefix}{}", k.as_str().unwrap());
+            match file.get(k) {
+                None => out.push(name),
+                Some(f) => keys_missing(&format!("{name}."), v, f, out),
+            }
+        }
     }
 }

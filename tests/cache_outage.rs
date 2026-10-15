@@ -4,6 +4,7 @@
 //! would stall the other backend tests, so this runs in a binary of its own.
 //! Needs ICHNOS_TEST_REDIS; skipped without it.
 
+use ichnos::config::Cache;
 use ichnos::redis_backend::RedisCache;
 use ichnos::store::cache::CacheBackend;
 use std::time::{Duration, Instant};
@@ -19,7 +20,8 @@ async fn a_cache_that_stops_answering_is_skipped_and_then_tried_again() {
         return;
     };
     let pause = Duration::from_millis(300);
-    let cache = RedisCache::connect_with_pause(&url, pause).await.unwrap();
+    let cfg = Cache { pause_ms: pause.as_millis() as u64, ..Cache::default() };
+    let cache = RedisCache::connect(&url, &cfg).await.unwrap();
     let key = format!("cache-outage-{}", std::process::id());
     cache.set_many(&[(key.clone(), "1".into(), 60)]).await;
     assert_eq!(cache.get_many(std::slice::from_ref(&key)).await, vec![Some("1".to_string())]);

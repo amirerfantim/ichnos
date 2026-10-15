@@ -10,29 +10,34 @@ kind: ConfigMap
 metadata:
   name: ichnos-config
 data:
-  config.toml: |
-    [server]
-    bind = "0.0.0.0:8080"
-
-    [cql]
-    nodes = ["scylla:9042"]
-    keyspace = "ichnos"
-    consistency_write = "LOCAL_QUORUM"
-    consistency_read = "LOCAL_ONE"
-    ttl_days = 180
-
-    [redis]
-    cache_url = "redis://redis-cache:6379/0"
-    queue_url = "redis://redis-queue:6379/0"
-
-    [ingest]
-    shards = 32
-    fold_window_secs = 45
-    stream_maxlen = 200000
-
-    [lease]
-    ttl_secs = 15
-    renew_secs = 5
+  # Every setting, in the one file Ichnos reads; nothing comes from the
+  # environment. A key left out keeps its default.
+  config.yaml: |
+    log:
+      level: info
+    server:
+      bind: 0.0.0.0:8080
+    cql:
+      nodes: ["scylla:9042"]
+      keyspace: ichnos
+      consistencyWrite: LOCAL_QUORUM
+      consistencyRead: LOCAL_ONE
+      ttlDays: 180
+    redis:
+      cacheUrl: redis://redis-cache:6379/0
+      queueUrl: redis://redis-queue:6379/0
+    ingest:
+      shards: 32
+      foldWindowSecs: 45
+      streamMaxlen: 200000
+    lease:
+      ttlSecs: 15
+      renewSecs: 5
+    # Each worker needs its own name in the lease registry, or two of them
+    # would believe they own the same shard. Left empty, each takes its host
+    # name, which is its pod name.
+    worker:
+      identity: ""
 ---
 apiVersion: v1
 kind: Service
@@ -64,11 +69,9 @@ spec:
       containers:
         - name: ichnos
           image: IMAGE_REF
-          args: ["serve", "--config", "/etc/ichnos/config.toml"]
+          # Reads /etc/ichnos/config.yaml, where the ConfigMap is mounted.
+          args: ["serve"]
           ports: [{containerPort: 8080, name: http}]
-          env:
-            - name: ICHNOS_LOG
-              value: info
           # Liveness only says the process is up. Readiness also checks that
           # storage answers, so a pod that cannot serve is taken out of
           # rotation rather than returning errors.
@@ -117,19 +120,12 @@ spec:
       containers:
         - name: ichnos
           image: IMAGE_REF
-          args: ["worker", "--config", "/etc/ichnos/config.toml"]
+          args: ["worker"]
           ports: [{containerPort: 8080, name: metrics}]
           livenessProbe:
             httpGet: {path: /health, port: 8080}
             initialDelaySeconds: 5
             periodSeconds: 15
-          env:
-            - name: ICHNOS_LOG
-              value: info
-            # Each worker needs its own name in the lease registry, or two of
-            # them would believe they own the same shard.
-            - name: POD_NAME
-              valueFrom: {fieldRef: {fieldPath: metadata.name}}
           resources:
             requests: {cpu: "100m", memory: "128Mi"}
             limits: {cpu: "1", memory: "512Mi"}

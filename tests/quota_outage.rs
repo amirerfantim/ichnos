@@ -5,6 +5,7 @@
 //! Needs ICHNOS_TEST_REDIS; skipped without it.
 
 use ichnos::api::quota::QuotaCounter;
+use ichnos::config::Cache;
 use ichnos::redis_backend::RedisQuota;
 use std::time::{Duration, Instant};
 
@@ -18,7 +19,7 @@ async fn a_counter_that_stops_answering_costs_a_caller_no_more_than_the_budget()
         eprintln!("skipped: ICHNOS_TEST_REDIS is not set");
         return;
     };
-    let quota = RedisQuota::connect(&url).await.unwrap();
+    let quota = RedisQuota::connect(&url, &Cache::default(), 48).await.unwrap();
     let key = format!("quota-outage-{}", std::process::id());
     assert!(quota.increment(&key).await.is_some());
 
