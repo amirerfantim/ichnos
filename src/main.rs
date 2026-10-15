@@ -26,8 +26,9 @@ use tracing::{info, warn};
 #[derive(Parser)]
 #[command(name = "ichnos", version, about = "Geolocation from WiFi and cell towers")]
 struct Cli {
-    /// Configuration file. Without one, defaults apply and `ICHNOS__` variables
-    /// override them.
+    /// Configuration file, YAML. Without one, /etc/ichnos/config.yaml, else
+    /// config/config.yaml, else the defaults. Nothing is read from the
+    /// environment.
     #[arg(short, long, global = true)]
     config: Option<PathBuf>,
 
@@ -54,8 +55,8 @@ enum Command {
     },
     /// Drain the queue and write what it learns.
     Worker {
-        /// Name used in the lease registry. Defaults to the hostname, which is
-        /// what distinguishes one pod from another.
+        /// Name used in the lease registry, over `worker.identity`. Defaults
+        /// to the hostname, which is what distinguishes one pod from another.
         #[arg(long)]
         identity: Option<String>,
     },
@@ -86,7 +87,7 @@ enum Command {
     },
     /// Print the effective configuration and exit.
     ///
-    /// Useful for seeing what the environment actually did to the defaults.
+    /// Useful for seeing what the file actually did to the defaults.
     ShowConfig,
 }
 
@@ -115,13 +116,15 @@ enum KeyAction {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    init_tracing();
-
-    let cfg = Config::load(cli.config.as_deref()).context("loading configuration")?;
+    let path = Config::find(cli.config.as_deref());
+    let cfg = Config::load(path.as_deref()).context("loading configuration")?;
+    init_tracing(&cfg.log);
 
     match cli.command {
         Command::ShowConfig => {
-            println!("{}", toml::to_string_pretty(&cfg)?);
+            let from = path.map_or("defaults only".into(), |p| p.display().to_string());
+            println!("# from: {from}");
+            print!("{}", cfg.to_yaml().map_err(|e| anyhow::anyhow!(e))?);
             Ok(())
         }
         Command::Serve { with_worker } => serve(cfg, cli.in_memory, with_worker).await,
@@ -137,11 +140,10 @@ async fn main() -> Result<()> {
 
 /// Structured logs by default, because they are read by machines far more often
 /// than by people.
-fn init_tracing() {
-    let filter = tracing_subscriber::EnvFilter::try_from_env("ICHNOS_LOG")
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+fn init_tracing(log: &ichnos::config::Log) {
+    let filter = tracing_subscriber::EnvFilter::new(&log.level);
     let builder = tracing_subscriber::fmt().with_env_filter(filter);
-    if std::env::var("ICHNOS_LOG_FORMAT").as_deref() == Ok("pretty") {
+    if log.format == "pretty" {
         builder.init();
     } else {
         builder.json().flatten_event(true).init();
@@ -160,7 +162,7 @@ async fn build_store(cfg: &Config, in_memory: bool) -> Result<Arc<dyn Store>> {
 
     let store = CqlStore::connect(&cfg.cql).await.context("connecting to the database")?;
 
-    match RedisCache::connect(&cfg.redis.cache_url).await {
+    match RedisCache::connect(&cfg.redis.cache_url, &cfg.cache).await {
         Ok(cache) => Ok(Arc::new(CachedStore::new(store, cache, cfg.cache.clone()))),
         Err(e) => {
             // A missing cache makes reads slower, not impossible, so it is not
@@ -187,6 +189,7 @@ async fn build_queue(cfg: &Config, in_memory: bool, consumer: String) -> Result<
         cfg.ingest.stream_maxlen,
         consumer,
         redeliver_after(cfg),
+        &cfg.queue,
     )
     .await
     .map_err(|e| anyhow::anyhow!("connecting to the queue: {e}"))?;
@@ -221,7 +224,7 @@ fn spawn_depth_poller(
 
 async fn serve(cfg: Config, in_memory: bool, with_worker: bool) -> Result<()> {
     let store = build_store(&cfg, in_memory).await?;
-    let queue = build_queue(&cfg, in_memory, format!("api-{}", identity())).await?;
+    let queue = build_queue(&cfg, in_memory, format!("api-{}", identity(&cfg))).await?;
     let keys = Arc::new(KeyCache::new(&cfg.api));
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -247,7 +250,7 @@ async fn serve(cfg: Config, in_memory: bool, with_worker: bool) -> Result<()> {
             store.clone(),
             leases,
             cfg.clone(),
-            format!("inline-{}", identity()),
+            format!("inline-{}", identity(&cfg)),
         );
         worker.announce().await.map_err(|e| anyhow::anyhow!("announcing: {e}"))?;
         worker.claim_shards().await.map_err(|e| anyhow::anyhow!("claiming shards: {e}"))?;
@@ -261,7 +264,8 @@ async fn serve(cfg: Config, in_memory: bool, with_worker: bool) -> Result<()> {
     let quota: Arc<dyn QuotaCounter> = if in_memory {
         Arc::new(MemoryQuota::new())
     } else {
-        match RedisQuota::connect(&cfg.redis.cache_url).await {
+        match RedisQuota::connect(&cfg.redis.cache_url, &cfg.cache, cfg.api.quota_keep_hours).await
+        {
             Ok(counter) => Arc::new(counter),
             Err(e) => {
                 warn!(error = %e, "no quota counter available; allowances will not be enforced");
@@ -287,7 +291,7 @@ async fn serve(cfg: Config, in_memory: bool, with_worker: bool) -> Result<()> {
 }
 
 async fn run_worker(cfg: Config, in_memory: bool, identity_arg: Option<String>) -> Result<()> {
-    let identity = identity_arg.unwrap_or_else(identity);
+    let identity = identity_arg.unwrap_or_else(|| identity(&cfg));
     let store = build_store(&cfg, in_memory).await?;
     let queue = build_queue(&cfg, in_memory, identity.clone()).await?;
 
@@ -344,7 +348,7 @@ async fn import(cfg: Config, in_memory: bool, input: &std::path::Path) -> Result
             Ok(station) => batch.push(station),
             Err(_) => skipped += 1,
         }
-        if batch.len() >= 1_000 {
+        if batch.len() >= cfg.import.batch {
             store.put_stations(&batch).await.map_err(|e| anyhow::anyhow!("{e}"))?;
             loaded += batch.len();
             batch.clear();
@@ -405,11 +409,13 @@ async fn keys(cfg: Config, in_memory: bool, action: KeyAction) -> Result<()> {
     Ok(())
 }
 
-/// What this process calls itself in the lease registry.
-fn identity() -> String {
-    std::env::var("HOSTNAME")
-        .or_else(|_| std::env::var("POD_NAME"))
-        .unwrap_or_else(|_| format!("local-{}", std::process::id()))
+/// What this process calls itself in the lease registry: `worker.identity`,
+/// else the host name, which in Kubernetes is the pod name.
+fn identity(cfg: &Config) -> String {
+    if !cfg.worker.identity.is_empty() {
+        return cfg.worker.identity.clone();
+    }
+    std::env::var("HOSTNAME").unwrap_or_else(|_| format!("local-{}", std::process::id()))
 }
 
 /// Stop on either signal Kubernetes might send.

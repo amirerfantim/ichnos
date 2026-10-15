@@ -30,14 +30,21 @@ async fn connect(url: &str) -> Result<ConnectionManager, String> {
 
 // ---------------------------------------------------------------- cache -----
 
-/// How long the cache is skipped after it fails to answer.
-pub const CACHE_PAUSE: Duration = Duration::from_secs(1);
-
-/// The most one cache call may take, all in: connecting, retrying, sending
-/// and the reply. The timeouts below bound one attempt; when a server
-/// vanishes mid-flight, a call can also wait on the reconnect and its retry,
-/// past a 500 ms caller's deadline.
-pub const CACHE_BUDGET: Duration = Duration::from_millis(150);
+/// A connection manager with the given limits, which reconnects on its own
+/// after a drop.
+async fn connect_with(
+    url: &str,
+    dial_ms: u64,
+    reply_ms: u64,
+    retries: usize,
+) -> Result<ConnectionManager, String> {
+    let client = Client::open(url).map_err(|e| e.to_string())?;
+    let config = ConnectionManagerConfig::new()
+        .set_connection_timeout(Some(Duration::from_millis(dial_ms)))
+        .set_response_timeout(Some(Duration::from_millis(reply_ms)))
+        .set_number_of_retries(retries);
+    ConnectionManager::new_with_config(client, config).await.map_err(|e| e.to_string())
+}
 
 /// The cache backend. Every failure here is swallowed and counted: a request
 /// must never fail because a cache was unreachable.
@@ -45,7 +52,7 @@ pub const CACHE_BUDGET: Duration = Duration::from_millis(150);
 /// Nor may it wait long on one. The cache only saves database reads, so it
 /// must never cost a caller more than it saves: a reply that takes longer
 /// than a cache reply ever should is a failure, and once the server fails to
-/// answer every command is skipped for [`CACHE_PAUSE`], so requests go
+/// answer every command is skipped for `cache.pauseMs`, so requests go
 /// straight to the database instead of each waiting out its own timeout.
 /// After the pause the next command tries again.
 #[derive(Clone)]
@@ -53,6 +60,8 @@ pub struct RedisCache {
     conn: ConnectionManager,
     errors: Arc<AtomicU64>,
     pause: Duration,
+    /// The most one call may take, all in.
+    budget: Duration,
     /// When this handle was made; `resume_at` counts from it.
     epoch: Instant,
     /// Nanoseconds after `epoch` until which commands are skipped.
@@ -60,24 +69,16 @@ pub struct RedisCache {
 }
 
 impl RedisCache {
-    pub async fn connect(url: &str) -> Result<Self, String> {
-        Self::connect_with_pause(url, CACHE_PAUSE).await
-    }
-
-    /// [`connect`](Self::connect) with another pause, for tests.
-    pub async fn connect_with_pause(url: &str, pause: Duration) -> Result<Self, String> {
-        let client = Client::open(url).map_err(|e| e.to_string())?;
-        // A cache reply takes well under a millisecond.
-        let config = ConnectionManagerConfig::new()
-            .set_connection_timeout(Some(Duration::from_millis(200)))
-            .set_response_timeout(Some(Duration::from_millis(100)))
-            .set_number_of_retries(1);
-        let conn =
-            ConnectionManager::new_with_config(client, config).await.map_err(|e| e.to_string())?;
+    /// Connect with the limits in `cfg`: its timeouts bound one attempt,
+    /// `budgetMs` a whole call, and `pauseMs` how long a silent server is
+    /// skipped.
+    pub async fn connect(url: &str, cfg: &crate::config::Cache) -> Result<Self, String> {
+        let conn = connect_with(url, cfg.dial_timeout_ms, cfg.read_timeout_ms, 1).await?;
         Ok(Self {
             conn,
             errors: Arc::new(AtomicU64::new(0)),
-            pause,
+            pause: Duration::from_millis(cfg.pause_ms),
+            budget: Duration::from_millis(cfg.budget_ms),
             epoch: Instant::now(),
             resume_at: Arc::new(AtomicU64::new(0)),
         })
@@ -108,14 +109,14 @@ impl RedisCache {
         self.pause_now(what, &error.to_string());
     }
 
-    /// Run one cache call within [`CACHE_BUDGET`]. A call past it counts as
+    /// Run one cache call within `cache.budgetMs`. A call past it counts as
     /// a server that did not answer.
     async fn bounded<T>(
         &self,
         what: &str,
         call: impl std::future::Future<Output = redis::RedisResult<T>>,
     ) -> Option<T> {
-        match tokio::time::timeout(CACHE_BUDGET, call).await {
+        match tokio::time::timeout(self.budget, call).await {
             Ok(Ok(value)) => Some(value),
             Ok(Err(e)) => {
                 self.note(what, e);
@@ -218,20 +219,16 @@ pub struct RedisQueue {
     epoch: Instant,
     /// Nanoseconds after `epoch` until which publishing is refused.
     resume_at: Arc<AtomicU64>,
-    /// See [`CONSUMER_IDLE`] and [`PRUNE_EVERY`]; tests shorten them.
+    /// See `queue.consumerIdleSecs` and `queue.pruneEverySecs`.
     consumer_idle: Duration,
     prune_every: Duration,
+    /// Calls taking back stuck entries in one read.
+    max_reclaim_calls: usize,
+    /// Entries per acknowledgement.
+    ack_chunk: usize,
     /// Per shard, nanoseconds after `epoch` until which a read does not prune.
     next_prune: Arc<Vec<AtomicU64>>,
 }
-
-/// Every worker that ever read a shard stays in its group's consumer list,
-/// which grows with every restart. A read looks at most once per
-/// [`PRUNE_EVERY`] for consumers idle longer than [`CONSUMER_IDLE`] and holding
-/// no entries, and removes them. A live worker removed this way (one that has
-/// simply not read this shard for a while) is added back by its next read.
-pub const CONSUMER_IDLE: Duration = Duration::from_secs(3600);
-pub const PRUNE_EVERY: Duration = Duration::from_secs(600);
 
 /// Removes a consumer only if it holds no entries, checked and done in one
 /// step: removing a consumer forgets its pending entries, which would then
@@ -243,43 +240,43 @@ end
 return -1
 "#;
 
-/// How long publishing is refused after the queue server fails to answer.
-///
-/// A submit waits for its publish, and a client that submitted can do
-/// nothing about a queue that is down: it should get its answer at once and
-/// the loss be counted, rather than every submit waiting out its own timeout
-/// and the reconnects behind it.
-pub const PUBLISH_PAUSE: Duration = Duration::from_secs(1);
-
 impl RedisQueue {
+    /// Connect with the limits in `cfg`.
+    ///
+    /// Every worker that ever read a shard stays in its group's consumer
+    /// list, which grows with every restart. A read looks at most once per
+    /// `pruneEverySecs` for consumers idle longer than `consumerIdleSecs` and
+    /// holding no entries, and removes them. A live worker removed this way
+    /// (one that has simply not read this shard for a while) is added back by
+    /// its next read.
+    ///
+    /// After the server fails to answer, publishing is refused for
+    /// `publishPauseMs`: a client that submitted can do nothing about a queue
+    /// that is down, so it gets its answer at once and the loss is counted.
     pub async fn connect(
         url: &str,
         shards: u32,
         maxlen: usize,
         consumer: String,
         redeliver_after: std::time::Duration,
+        cfg: &crate::config::QueueCfg,
     ) -> Result<Self, String> {
-        let client = Client::open(url).map_err(|e| e.to_string())?;
-        // Give up on a server that does not take a connection quickly; a
-        // reply keeps the client's 500 ms.
-        let config = ConnectionManagerConfig::new()
-            .set_connection_timeout(Some(Duration::from_millis(200)))
-            .set_number_of_retries(1);
         let queue = Self {
-            conn: ConnectionManager::new_with_config(client, config)
-                .await
-                .map_err(|e| e.to_string())?,
+            conn: connect_with(url, cfg.dial_timeout_ms, cfg.read_timeout_ms, cfg.max_retries)
+                .await?,
             maxlen,
             group: "ichnos".into(),
             consumer,
             redeliver_after,
             shards,
             trimmed_at_open: 0,
-            publish_pause: PUBLISH_PAUSE,
+            publish_pause: Duration::from_millis(cfg.publish_pause_ms),
             epoch: Instant::now(),
             resume_at: Arc::new(AtomicU64::new(0)),
-            consumer_idle: CONSUMER_IDLE,
-            prune_every: PRUNE_EVERY,
+            consumer_idle: Duration::from_secs(cfg.consumer_idle_secs),
+            prune_every: Duration::from_secs(cfg.prune_every_secs),
+            max_reclaim_calls: cfg.max_reclaim_calls,
+            ack_chunk: cfg.ack_chunk,
             next_prune: Arc::new((0..shards).map(|_| AtomicU64::new(0)).collect()),
         };
         for shard in 0..shards {
@@ -459,7 +456,7 @@ impl RedisQueue {
         // One call scans at most `count` pending entries, so a long pending
         // list takes a few calls. The bound keeps a huge one from stalling
         // the shard; what is left is picked up on the next read.
-        for _ in 0..MAX_RECLAIM_CALLS {
+        for _ in 0..self.max_reclaim_calls {
             let wanted = max - entries.len();
             let reply: redis::Value = redis::cmd("XAUTOCLAIM")
                 .arg(Self::stream(shard))
@@ -530,9 +527,6 @@ impl RedisQueue {
     }
 }
 
-/// Upper bound on XAUTOCLAIM calls in one read.
-const MAX_RECLAIM_CALLS: usize = 8;
-
 #[async_trait]
 impl Queue for RedisQueue {
     async fn publish(&self, entries: &[(u32, Observation)]) -> Result<usize, QueueError> {
@@ -593,7 +587,7 @@ impl Queue for RedisQueue {
         // delete every stream would sit at its cap for ever, so depth would
         // count finished work and the cap would trim what was already done.
         // Chunked, because a script can unpack only so many arguments.
-        for chunk in ids.chunks(1_000) {
+        for chunk in ids.chunks(self.ack_chunk) {
             redis::Script::new(ACK_SCRIPT)
                 .key(Self::stream(shard))
                 .key(Self::acked_key(shard))
@@ -759,12 +753,16 @@ fn as_string(value: &redis::Value) -> Option<String> {
 ///
 /// The counters live on the cache server, and a request whose count fails is
 /// allowed, so a count must never cost a caller more than the cache would:
-/// the cache's timeouts, [`CACHE_BUDGET`] in total, and once the server fails
-/// to answer, counting is skipped for [`CACHE_PAUSE`].
+/// the cache's timeouts, `cache.budgetMs` in total, and once the server fails
+/// to answer, counting is skipped for `cache.pauseMs`.
 #[derive(Clone)]
 pub struct RedisQuota {
     conn: ConnectionManager,
     pause: Duration,
+    /// The most one count may take, all in.
+    budget: Duration,
+    /// How long a counter lives, in seconds.
+    keep_secs: i64,
     /// When this handle was made; `resume_at` counts from it.
     epoch: Instant,
     /// Nanoseconds after `epoch` until which counts are skipped.
@@ -772,17 +770,18 @@ pub struct RedisQuota {
 }
 
 impl RedisQuota {
-    pub async fn connect(url: &str) -> Result<Self, String> {
-        let client = Client::open(url).map_err(|e| e.to_string())?;
-        let config = ConnectionManagerConfig::new()
-            .set_connection_timeout(Some(Duration::from_millis(200)))
-            .set_response_timeout(Some(Duration::from_millis(100)))
-            .set_number_of_retries(1);
-        let conn =
-            ConnectionManager::new_with_config(client, config).await.map_err(|e| e.to_string())?;
+    /// Connect with the cache's limits; a counter lives `keep_hours`.
+    pub async fn connect(
+        url: &str,
+        cfg: &crate::config::Cache,
+        keep_hours: u64,
+    ) -> Result<Self, String> {
+        let conn = connect_with(url, cfg.dial_timeout_ms, cfg.read_timeout_ms, 1).await?;
         Ok(Self {
             conn,
-            pause: CACHE_PAUSE,
+            pause: Duration::from_millis(cfg.pause_ms),
+            budget: Duration::from_millis(cfg.budget_ms),
+            keep_secs: i64::try_from(keep_hours.saturating_mul(3_600)).unwrap_or(i64::MAX),
             epoch: Instant::now(),
             resume_at: Arc::new(AtomicU64::new(0)),
         })
@@ -824,8 +823,8 @@ impl crate::api::quota::QuotaCounter for RedisQuota {
         // Increment and set the expiry together, so a counter cannot survive
         // past the day it belongs to if the second command were to be lost.
         let mut pipe = redis::pipe();
-        pipe.atomic().incr(&counter, 1).expire(&counter, 172_800).ignore();
-        match tokio::time::timeout(CACHE_BUDGET, pipe.query_async::<(i64,)>(&mut conn)).await {
+        pipe.atomic().incr(&counter, 1).expire(&counter, self.keep_secs).ignore();
+        match tokio::time::timeout(self.budget, pipe.query_async::<(i64,)>(&mut conn)).await {
             Ok(Ok((count,))) => Some(count),
             Ok(Err(e)) => {
                 if !matches!(e.kind(), ErrorKind::Server(_) | ErrorKind::Extension) {

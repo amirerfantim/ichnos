@@ -647,7 +647,7 @@ fn parse_address_map(
         let parse = |value: &str| -> Result<std::net::SocketAddr> {
             value.parse::<std::net::SocketAddr>().map_err(|_| {
                 StoreError::Query(format!(
-                    "cql.address_map entries must be host:port, but got {value:?}"
+                    "cql.addressMap entries must be host:port, but got {value:?}"
                 ))
             })
         };

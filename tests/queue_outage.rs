@@ -4,6 +4,7 @@
 //! would stall the other backend tests, so this runs in a binary of its own.
 //! Needs ICHNOS_TEST_REDIS_QUEUE; skipped without it.
 
+use ichnos::config::QueueCfg;
 use ichnos::ingest::queue::{Queue, QueueError};
 use ichnos::model::key::WifiKey;
 use ichnos::model::observation::ReportSource;
@@ -35,10 +36,17 @@ async fn a_queue_that_stops_answering_refuses_publishing_at_once_for_a_while() {
         eprintln!("skipped: ICHNOS_TEST_REDIS_QUEUE is not set");
         return;
     };
-    let queue = RedisQueue::connect(&url, 48, 1_000, "w".into(), Duration::from_secs(30))
-        .await
-        .unwrap()
-        .with_publish_pause(Duration::from_millis(300));
+    let queue = RedisQueue::connect(
+        &url,
+        48,
+        1_000,
+        "w".into(),
+        Duration::from_secs(30),
+        &QueueCfg::default(),
+    )
+    .await
+    .unwrap()
+    .with_publish_pause(Duration::from_millis(300));
     let shard = 47;
     assert_eq!(queue.publish(&[(shard, observation())]).await.unwrap(), 1);
 

@@ -593,7 +593,7 @@ async fn debug_station(
     }
 }
 
-/// Answer a client request that runs past `server.request_timeout_ms` with a
+/// Answer a client request that runs past `server.requestTimeoutMs` with a
 /// 503, rather than holding the client for as long as a slow dependency does.
 /// A locate that cannot answer quickly is worth less than a fast "no".
 async fn request_timeout(State(limit): State<Duration>, request: Request, next: Next) -> Response {

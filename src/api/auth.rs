@@ -86,7 +86,7 @@ impl KeyCache {
     /// Check a caller's key and permission.
     ///
     /// When keys are not required, any caller is allowed everything. That is
-    /// for local development only; `api.require_keys` defaults to on precisely
+    /// for local development only; `api.requireKeys` defaults to on precisely
     /// so a service reachable by anyone cannot be left open by omission.
     pub async fn check<S: Store + ?Sized>(
         &self,
