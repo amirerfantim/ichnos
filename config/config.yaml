@@ -1,0 +1,168 @@
+# Every Ichnos setting, set for running locally against the stack from
+# docker-compose.yml (`docker compose up -d`):
+#
+#   cargo run -- serve --with-worker
+#
+# Ichnos reads one YAML file and nothing else: --config names it, else
+# /etc/ichnos/config.yaml (where deployments mount it), else this file.
+# A key that is left out keeps its default; an unknown key stops the start.
+# `ichnos show-config` prints what was loaded.
+log:
+  # debug, info, warn or error.
+  level: info
+  # json (one object per line, for machines) or pretty (for a terminal).
+  format: json
+server:
+  bind: 127.0.0.1:8080
+  requestTimeoutMs: 2000
+locate:
+  wifi:
+    maxClusterMeters: 500
+    minInCluster: 2
+    maxInCluster: 20
+    minAccuracyM: 10
+    maxAccuracyM: 500
+    minSignalDbm: -100
+  cell:
+    maxClusterMeters: 500
+    minInCluster: 1
+    maxInCluster: 20
+    minAccuracyM: 1000
+    maxAccuracyM: 50000
+    minSignalDbm: -100
+validation:
+  maxObservationAgeMs: 20000
+  maxObservationAccuracyM: 1000
+  wifiMaxObservationAccuracyM: 200
+  cellMaxObservationAccuracyM: 1000
+  maxObservationSpeedMps: 50
+  minAgeMs: -3600000
+  maxAgeMs: 3600000
+  minAccuracyM: 0
+  maxAccuracyM: 1000000
+  minSpeedMps: 0
+  maxSpeedMps: 300
+  latBounds: [-85.051, 85.051]
+  lonBounds: [-180, 180]
+  wifiFrequencyMhz: [2400, 5999]
+  wifiSignalDbm: [-100, -10]
+  lac: [1, 65533]
+  cid: [1, 268435455]
+  cidGsmMax: 65535
+  psc: [0, 511]
+  pscLteMax: 503
+  cellTa: [0, 63]
+  mcc: [1, 999]
+  mnc: [0, 999]
+  mccAllowlist: []
+  invalidMacs: ["000000000000", "ffffffffffff", "01005e901000"]
+  # Report times outside this range (Unix ms; 2001 to 2286) are not times at
+  # all, and the clock is used instead.
+  timestampMs: [1000000000000, 10000000000000]
+station:
+  wifiMaxRadiusM: 5000
+  cellMaxRadiusM: 100000
+  maxOldWeight: 10000
+  oldPositionDays: 365
+block:
+  temporaryDays: 7
+  # One forgiven block per this many days of known age. Upstream uses 30,
+  # which is where the familiar 45-day recovery comes from.
+  budgetDays: 10
+score:
+  maxSampleScore: 10
+  minSampleScore: 0.5
+  collectionDays: 10
+ingest:
+  shards: 32
+  foldWindowSecs: 45
+  streamMaxlen: 200000
+  readBatch: 5000
+  maxDrainBatches: 50
+  # An entry taken but never acknowledged (its worker died, lost the shard,
+  # or failed to write) is taken again after this long. At least
+  # lease.ttlSecs.
+  redeliverAfterSecs: 30
+  collapseByPosition: false
+  collapseBucketM: 10
+lease:
+  ttlSecs: 15
+  renewSecs: 5
+  maxShardsPerWorker: 0
+elision:
+  minMoveM: 1
+  enabled: true
+spatial:
+  h3Resolution: 9
+cache:
+  enabled: true
+  hitTtlSecs: 300
+  missTtlSecs: 60
+  # Limits on the cache server, which also holds the quota counters. The
+  # timeouts bound one attempt; budgetMs bounds a whole call. A silent cache
+  # costs a request at most the budget, then is skipped for pauseMs.
+  dialTimeoutMs: 200
+  readTimeoutMs: 100
+  budgetMs: 150
+  pauseMs: 1000
+# Limits on the queue server. After a failed publish, submits are answered at
+# once for publishPauseMs and the loss is counted. Consumers idle for
+# consumerIdleSecs and holding nothing are removed, at most every
+# pruneEverySecs. ackChunk is at most 7000, a Lua limit.
+queue:
+  dialTimeoutMs: 200
+  readTimeoutMs: 500
+  maxRetries: 1
+  publishPauseMs: 1000
+  consumerIdleSecs: 3600
+  pruneEverySecs: 600
+  maxReclaimCalls: 8
+  ackChunk: 1000
+cql:
+  nodes: ["127.0.0.1:9042"]
+  keyspace: ichnos
+  username: null
+  password: null
+  writeConcurrency: 256
+  readConcurrency: 32
+  # A single-node development cluster cannot reach a quorum, so use ONE there.
+  consistencyWrite: LOCAL_QUORUM
+  consistencyRead: LOCAL_ONE
+  # Row lifetime, refreshed by every write. This is what bounds the dataset,
+  # and it replaces a cleanup job entirely.
+  ttlDays: 180
+  connectTimeoutMs: 5000
+  requestTimeoutMs: 2000
+  # Only needed when nodes advertise addresses this process cannot reach,
+  # such as through a forwarded port or behind NAT:
+  #   addressMap: {"10.0.0.5:9042": "127.0.0.1:9042"}
+  addressMap: {}
+redis:
+  cacheUrl: redis://127.0.0.1:6379/0
+  queueUrl: redis://127.0.0.1:6380/0
+  poolTimeoutMs: 1000
+api:
+  maxNetworks: 20
+  maxItems: 100
+  maxBodyBytes: 1048576
+  defaultDailyQuota: 0
+  keyCacheSecs: 60
+  requireKeys: false
+  locateSamplePercent: 100
+  # How long a daily quota counter lives. More than 24.
+  quotaKeepHours: 48
+metrics:
+  # Sample queue depth in the background. Off leaves the depth gauges empty,
+  # which costs the earliest warning the service has.
+  pollEnabled: true
+  pollSecs: 15
+  # Record each kept observation's weight, claimed accuracy, reporter speed
+  # and scan age. Four histogram writes per observation, on the hottest path
+  # there is. Worth it while tuning; worth turning off once the answers settle.
+  observationDetail: true
+worker:
+  # Empty uses the host name, which in Kubernetes is the pod name.
+  identity: ""
+import:
+  # Stations per database write in `ichnos import`.
+  batch: 1000

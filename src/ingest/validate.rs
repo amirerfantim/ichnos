@@ -131,8 +131,8 @@ pub fn validate_item(item: &SubmitItem, cfg: &Validation) -> Validated {
     // How long before the request the fix was taken. Zero or absent means
     // the times in the report are already the fix's.
     let fix_age = position.age.filter(|age| age.is_finite() && *age != 0.0);
-    let timestamp =
-        fix_timestamp(item.timestamp, fix_age).unwrap_or_else(|| Utc::now().timestamp_millis());
+    let timestamp = fix_timestamp(item.timestamp, fix_age, cfg.timestamp_ms)
+        .unwrap_or_else(|| Utc::now().timestamp_millis());
 
     let observation = |key, own_age, signal| Observation {
         key,
@@ -197,17 +197,16 @@ pub fn validate_item(item: &SubmitItem, cfg: &Validation) -> Validated {
     out
 }
 
-/// The report's time moved back to the fix. Outside 2001-2286 it is not a
-/// time at all, and the caller uses the clock instead.
-fn fix_timestamp(timestamp: Option<i64>, fix_age: Option<f64>) -> Option<i64> {
-    const EARLIEST: i64 = 1_000_000_000_000;
-    const LATEST: i64 = 10_000_000_000_000;
+/// The report's time moved back to the fix. Outside `bounds`
+/// (`validation.timestampMs`, 2001 to 2286 by default) it is not a time at
+/// all, and the caller uses the clock instead.
+fn fix_timestamp(timestamp: Option<i64>, fix_age: Option<f64>, bounds: (i64, i64)) -> Option<i64> {
     let at = timestamp.filter(|t| *t != 0)?;
     let at = match fix_age {
         Some(age) => (at as f64 - age) as i64,
         None => at,
     };
-    (EARLIEST..=LATEST).contains(&at).then_some(at)
+    (bounds.0..=bounds.1).contains(&at).then_some(at)
 }
 
 /// A scan's age measured from the fix, in whole milliseconds, or nothing

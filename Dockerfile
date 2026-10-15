@@ -35,7 +35,6 @@ COPY schema /opt/ichnos/schema
 
 USER 10001
 WORKDIR /home/ichnos
-ENV ICHNOS_LOG=info
 
 EXPOSE 8080
 ENTRYPOINT ["/usr/local/bin/ichnos"]

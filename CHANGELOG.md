@@ -11,10 +11,29 @@
   Upstream's rules throughout: an answer is skipped when every network it
   named was used and already seen today (never when it named a cell); fewer
   than two access points are not learned; the report passes the same
-  validation as a submitted one. `api.locate_sample_percent` scales every key,
+  validation as a submitted one. `api.locateSamplePercent` scales every key,
   like upstream's `global_locate_sample_rate`. Keys default to zero, as
   upstream. Counted by `ichnos_locate_learned_total{outcome}`. An older
   keyspace needs `schema/002_store_sample_locate.cql`.
+
+### Changed
+
+- **One YAML config file.** Every setting lives in one file: `--config`,
+  else `/etc/ichnos/config.yaml`, else `config/config.yaml`, else the
+  defaults. Keys are camelCase (`ingest.foldWindowSecs`), as the Go sibling
+  writes them. A file only needs the keys it changes, down to one field of a
+  nested section; an unknown key stops the start. The `ICHNOS__SECTION__KEY`
+  environment overrides, `ICHNOS_LOG`, `ICHNOS_LOG_FORMAT` and `POD_NAME` are
+  gone: use `log.level`, `log.format` and `worker.identity` (empty uses the
+  host name). `show-config` prints YAML and names the file it read.
+  `config/example.toml` is now `config/config.yaml`, which lists every key.
+- **The fixed limits are settings too**, with the old values as defaults:
+  the cache and quota timeouts, budget and pause (`cache.dialTimeoutMs`,
+  `readTimeoutMs`, `budgetMs`, `pauseMs`); the queue's timeouts, retries,
+  publish pause, consumer pruning, reclaim calls and acknowledgement size
+  (`queue.*`); how long a quota counter lives (`api.quotaKeepHours`); the
+  import batch (`import.batch`); and the range of report times accepted
+  (`validation.timestampMs`). The names and defaults are the Go sibling's.
 
 ### Fixed
 
@@ -87,8 +106,8 @@
   when its own key was asked for again, so a flood of made-up keys, each
   asked once, stayed in memory for ever. Past 10,000 entries, expired ones
   are now swept on insert, which bounds the cache by what arrives within
-  `api.key_cache_secs`.
-- **`server.request_timeout_ms` and `api.max_body_bytes` did nothing.** No
+  `api.keyCacheSecs`.
+- **`server.requestTimeoutMs` and `api.maxBodyBytes` did nothing.** No
   request was ever timed out, and bodies up to axum's 2 MiB default were read
   whatever the setting said. A client request (`/v1/observations`,
   `/v1/locate`) that runs past the timeout is now answered with a 503 and the
@@ -132,7 +151,7 @@
   entries. A worker that died mid-batch, lost its shard, or failed to write
   left those observations stuck in Redis, uncounted and never learned. A read
   now first takes entries that have waited longer than
-  `ingest.redeliver_after_secs` (`XAUTOCLAIM`), then new ones. The in-memory
+  `ingest.redeliverAfterSecs` (`XAUTOCLAIM`), then new ones. The in-memory
   queue behaved correctly only because tests put entries back by hand; it now
   redelivers on its own, the same way Redis does, and the manual step is gone.
 - An entry that could not be decoded was skipped but never acknowledged. With
@@ -155,7 +174,7 @@
 
 ### Added
 
-- `ingest.redeliver_after_secs` (default 30, at least `lease.ttl_secs`) and
+- `ingest.redeliverAfterSecs` (default 30, at least `lease.ttlSecs`) and
   `ichnos_queue_redelivered_total`. A steady rise in the counter means workers
   are dying or failing to write while the queue itself looks healthy.
 - CI runs the Redis tests against a real Redis instead of skipping them.
