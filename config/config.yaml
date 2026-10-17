@@ -141,6 +141,7 @@ redis:
   cacheUrl: redis://127.0.0.1:6379/0
   queueUrl: redis://127.0.0.1:6380/0
   poolTimeoutMs: 1000
+  clusterReloadMs: 1000
 api:
   maxNetworks: 20
   maxItems: 100

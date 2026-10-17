@@ -43,6 +43,7 @@ async fn a_queue_that_stops_answering_refuses_publishing_at_once_for_a_while() {
         "w".into(),
         Duration::from_secs(30),
         &QueueCfg::default(),
+        1_000,
     )
     .await
     .unwrap()

@@ -19,7 +19,7 @@ async fn a_counter_that_stops_answering_costs_a_caller_no_more_than_the_budget()
         eprintln!("skipped: ICHNOS_TEST_REDIS is not set");
         return;
     };
-    let quota = RedisQuota::connect(&url, &Cache::default(), 48).await.unwrap();
+    let quota = RedisQuota::connect(&url, &Cache::default(), 48, 1_000).await.unwrap();
     let key = format!("quota-outage-{}", std::process::id());
     assert!(quota.increment(&key).await.is_some());
 

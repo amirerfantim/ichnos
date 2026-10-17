@@ -544,13 +544,20 @@ impl Default for Cql {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields, rename_all = "camelCase")]
 pub struct RedisCfg {
-    /// Cache instance. Losing entries here is free, so it may run an eviction
-    /// policy.
+    /// The cache's Redis Cluster, by one of its nodes. Losing entries here is
+    /// free, so it may run an eviction policy.
     pub cache_url: String,
-    /// Queue instance. Losing entries here must be a counted decision, so it
-    /// must not run an eviction policy; the streams cap themselves instead.
+    /// The queue's and the leases' Redis Cluster, which may be the cache's.
+    /// Losing entries here should be a counted decision, so it is best
+    /// without an eviction policy; the streams cap themselves instead.
     pub queue_url: String,
     pub pool_timeout_ms: u64,
+    /// How long a connection may keep its map of the cluster, which node
+    /// holds which slots, after a node fails to answer, before it is made
+    /// again with a fresh one. The map is otherwise read again only when a
+    /// node redirects a command; a primary that dies cannot, so this bounds
+    /// how long commands keep going to it after a replica has taken over.
+    pub cluster_reload_ms: u64,
 }
 
 impl Default for RedisCfg {
@@ -559,6 +566,7 @@ impl Default for RedisCfg {
             cache_url: "redis://127.0.0.1:6379/0".into(),
             queue_url: "redis://127.0.0.1:6380/0".into(),
             pool_timeout_ms: 1_000,
+            cluster_reload_ms: 1_000,
         }
     }
 }
@@ -669,6 +677,9 @@ impl Config {
 
         if self.ingest.shards == 0 {
             return bad("ingest.shards must be at least 1".into());
+        }
+        if self.redis.cluster_reload_ms == 0 {
+            return bad("redis.clusterReloadMs must be at least 1".into());
         }
         if !(0.0..=100.0).contains(&self.api.locate_sample_percent) {
             return bad(format!(
@@ -881,6 +892,14 @@ mod tests {
         let mut c = Config::for_tests();
         c.ingest.shards = 0;
         assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn a_cluster_map_that_is_never_read_again_is_rejected() {
+        let mut c = Config::for_tests();
+        c.redis.cluster_reload_ms = 0;
+        let err = c.validate().unwrap_err().to_string();
+        assert!(err.contains("redis.clusterReloadMs"), "{err}");
     }
 
     #[test]

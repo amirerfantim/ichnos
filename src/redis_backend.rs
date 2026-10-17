@@ -1,50 +1,175 @@
 //! Redis implementations of the cache, the queue and the shard leases.
 //!
-//! Two separate Redis instances, and the separation is not fussiness. Redis
-//! applies its eviction policy per instance, so a cache configured to evict
-//! under pressure would happily throw away queued work sitting in the same
-//! server. Losing a cache entry costs a database read. Losing a queue entry
-//! costs data. Those need different policies, so they need different servers:
+//! Two Redis servers, and the separation is not fussiness. Redis applies its
+//! eviction policy to a whole server, so a cache configured to evict under
+//! pressure would happily throw away queued work sitting in the same server.
+//! Losing a cache entry costs a database read. Losing a queue entry costs
+//! data. Those want different policies, so they are best on different
+//! servers:
 //!
-//! - the **cache** instance may evict freely,
-//! - the **queue** instance must not evict at all, and bounds itself by capping
+//! - the **cache** may evict freely,
+//! - the **queue** is best not evicting at all, and bounds itself by capping
 //!   each stream instead.
+//!
+//! Each is a Redis Cluster, of one node or more: every connection here is a
+//! cluster connection. One node that holds every slot is a whole cluster,
+//! which is how a small deployment and the tests run it. A cluster refuses a
+//! command, or a pipeline, whose keys are in different slots, so a one-node
+//! cluster catches those as surely as a large one.
 
 use crate::ingest::lease::{LeaseError, Leases};
 use crate::ingest::queue::{Entry, Queue, QueueError};
 use crate::model::Observation;
 use crate::store::cache::CacheBackend;
 use async_trait::async_trait;
-use redis::aio::{ConnectionManager, ConnectionManagerConfig};
-use redis::{AsyncCommands, Client, ErrorKind};
+use futures::future::join_all;
+use redis::cluster::{ClusterClient, ClusterClientBuilder};
+use redis::cluster_async::ClusterConnection;
+use redis::{AsyncCommands, ErrorKind, IntoConnectionInfo, RedisError};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 use tracing::warn;
 
-/// Open a connection manager, which reconnects on its own after a drop.
-async fn connect(url: &str) -> Result<ConnectionManager, String> {
-    let client = Client::open(url).map_err(|e| e.to_string())?;
-    ConnectionManager::new(client).await.map_err(|e| e.to_string())
+/// Whether an error is the server's answer to the command, rather than a
+/// failure to answer.
+fn refused(error: &RedisError) -> bool {
+    matches!(error.kind(), ErrorKind::Server(_) | ErrorKind::Extension)
+}
+
+/// A cluster connection that reconnects on its own after a drop, and is made
+/// again after a node fails to answer.
+///
+/// The connection learns which node holds which slots when it is made, and
+/// again only when a node redirects it. A primary that dies cannot redirect
+/// anyone, so after its replica takes over the connection would keep trying
+/// the dead node. A command that the server did not answer makes a new
+/// connection, which reads the cluster's map afresh, at most once per
+/// `redis.clusterReloadMs`.
+#[derive(Clone)]
+struct Cluster {
+    client: ClusterClient,
+    conn: Arc<RwLock<ClusterConnection>>,
+    reload: Duration,
+    /// When this handle was made; `next_reload` counts from it.
+    epoch: Instant,
+    /// Nanoseconds after `epoch` before which no new connection is made.
+    next_reload: Arc<AtomicU64>,
+    /// Connections made again so far.
+    remade: Arc<AtomicU64>,
+}
+
+impl Cluster {
+    /// Connect to the cluster that `url` names one node of. A cluster has
+    /// only database 0, so a URL that asks for another is refused rather than
+    /// quietly sharing database 0.
+    async fn open(
+        url: &str,
+        dial: Option<Duration>,
+        reply: Option<Duration>,
+        retries: u32,
+        reload_ms: u64,
+    ) -> Result<Self, String> {
+        let info = url.into_connection_info().map_err(|e| e.to_string())?;
+        if info.redis_settings().db() != 0 {
+            return Err(format!(
+                "a cluster has only database 0, and the URL asks for {}",
+                info.redis_settings().db()
+            ));
+        }
+        let mut builder = ClusterClientBuilder::new(vec![info]).retries(retries);
+        if let Some(dial) = dial {
+            builder = builder.connection_timeout(dial);
+        }
+        if let Some(reply) = reply {
+            builder = builder.response_timeout(reply);
+        }
+        let client = builder.build().map_err(|e| e.to_string())?;
+        let conn = client.get_async_connection().await.map_err(|e| e.to_string())?;
+        Ok(Self {
+            client,
+            conn: Arc::new(RwLock::new(conn)),
+            reload: Duration::from_millis(reload_ms),
+            epoch: Instant::now(),
+            next_reload: Arc::new(AtomicU64::new(0)),
+            remade: Arc::new(AtomicU64::new(0)),
+        })
+    }
+
+    /// The current connection. It multiplexes: clones share it.
+    fn get(&self) -> ClusterConnection {
+        self.conn.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// Note a failed command: one the server did not answer makes a new
+    /// connection; see [`Cluster::unanswered`]. Returns the error, for
+    /// chaining.
+    fn failed(&self, error: RedisError) -> RedisError {
+        if !refused(&error) {
+            self.unanswered();
+        }
+        error
+    }
+
+    /// The server did not answer: make a new connection in the background,
+    /// unless one was made within the reload interval.
+    fn unanswered(&self) {
+        let now = self.epoch.elapsed().as_nanos() as u64;
+        let next = self.next_reload.load(Ordering::Relaxed);
+        if now < next
+            || self
+                .next_reload
+                .compare_exchange(
+                    next,
+                    now + self.reload.as_nanos() as u64,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                )
+                .is_err()
+        {
+            return;
+        }
+        let (client, conn, remade) = (self.client.clone(), self.conn.clone(), self.remade.clone());
+        tokio::spawn(async move {
+            match client.get_async_connection().await {
+                Ok(fresh) => {
+                    *conn.write().unwrap_or_else(|e| e.into_inner()) = fresh;
+                    let n = remade.fetch_add(1, Ordering::Relaxed) + 1;
+                    tracing::info!(
+                        times = n,
+                        "made the cluster connection again, with a fresh map"
+                    );
+                }
+                Err(e) => warn!(error = %e, "could not make the cluster connection again"),
+            }
+        });
+    }
+
+    /// `result`, with a failure noted.
+    fn check<T>(&self, result: redis::RedisResult<T>) -> redis::RedisResult<T> {
+        result.map_err(|e| self.failed(e))
+    }
+}
+
+/// The values of one command per key, sent at once over the multiplexed
+/// connection, or the first error. Not one multi-key command or pipeline: the
+/// keys are in different slots, which a cluster refuses together.
+async fn each<T, F, Fut>(
+    keys: impl IntoIterator<Item = F>,
+    run: impl Fn(F) -> Fut,
+) -> Vec<redis::RedisResult<T>>
+where
+    Fut: std::future::Future<Output = redis::RedisResult<T>>,
+{
+    join_all(keys.into_iter().map(run)).await
+}
+
+/// The first error of `results`, if any.
+fn first_error<T>(results: Vec<redis::RedisResult<T>>) -> redis::RedisResult<Vec<T>> {
+    results.into_iter().collect()
 }
 
 // ---------------------------------------------------------------- cache -----
-
-/// A connection manager with the given limits, which reconnects on its own
-/// after a drop.
-async fn connect_with(
-    url: &str,
-    dial_ms: u64,
-    reply_ms: u64,
-    retries: usize,
-) -> Result<ConnectionManager, String> {
-    let client = Client::open(url).map_err(|e| e.to_string())?;
-    let config = ConnectionManagerConfig::new()
-        .set_connection_timeout(Some(Duration::from_millis(dial_ms)))
-        .set_response_timeout(Some(Duration::from_millis(reply_ms)))
-        .set_number_of_retries(retries);
-    ConnectionManager::new_with_config(client, config).await.map_err(|e| e.to_string())
-}
 
 /// The cache backend. Every failure here is swallowed and counted: a request
 /// must never fail because a cache was unreachable.
@@ -57,7 +182,7 @@ async fn connect_with(
 /// After the pause the next command tries again.
 #[derive(Clone)]
 pub struct RedisCache {
-    conn: ConnectionManager,
+    conn: Cluster,
     errors: Arc<AtomicU64>,
     pause: Duration,
     /// The most one call may take, all in.
@@ -71,9 +196,20 @@ pub struct RedisCache {
 impl RedisCache {
     /// Connect with the limits in `cfg`: its timeouts bound one attempt,
     /// `budgetMs` a whole call, and `pauseMs` how long a silent server is
-    /// skipped.
-    pub async fn connect(url: &str, cfg: &crate::config::Cache) -> Result<Self, String> {
-        let conn = connect_with(url, cfg.dial_timeout_ms, cfg.read_timeout_ms, 1).await?;
+    /// skipped. `reload_ms` is `redis.clusterReloadMs`.
+    pub async fn connect(
+        url: &str,
+        cfg: &crate::config::Cache,
+        reload_ms: u64,
+    ) -> Result<Self, String> {
+        let conn = Cluster::open(
+            url,
+            Some(Duration::from_millis(cfg.dial_timeout_ms)),
+            Some(Duration::from_millis(cfg.read_timeout_ms)),
+            1,
+            reload_ms,
+        )
+        .await?;
         Ok(Self {
             conn,
             errors: Arc::new(AtomicU64::new(0)),
@@ -102,10 +238,11 @@ impl RedisCache {
     /// and pauses the cache, logged once per pause.
     fn note(&self, what: &str, error: redis::RedisError) {
         self.errors.fetch_add(1, Ordering::Relaxed);
-        if matches!(error.kind(), ErrorKind::Server(_) | ErrorKind::Extension) {
+        if refused(&error) {
             warn!(operation = what, error = %error, "cache operation failed; falling through");
             return;
         }
+        self.conn.unanswered();
         self.pause_now(what, &error.to_string());
     }
 
@@ -124,6 +261,7 @@ impl RedisCache {
             }
             Err(_) => {
                 self.errors.fetch_add(1, Ordering::Relaxed);
+                self.conn.unanswered();
                 self.pause_now(what, "no answer within the call budget");
                 None
             }
@@ -160,37 +298,60 @@ impl CacheBackend for RedisCache {
         if self.paused() {
             return vec![None; keys.len()];
         }
-        let mut conn = self.conn.clone();
-        // A single MGET, so one round trip covers every station in a request.
-        match self.bounded("mget", conn.mget::<_, Vec<Option<String>>>(keys)).await {
-            Some(values) if values.len() == keys.len() => values,
-            _ => vec![None; keys.len()],
+        let conn = self.conn.get();
+        // One GET per key, all sent at once: one round trip to each node
+        // covers every station in a request. A key whose read fails is a miss.
+        let call = each(keys, |key| {
+            let mut conn = conn.clone();
+            async move { conn.get::<_, Option<String>>(key).await }
+        });
+        let Some(results) = self.bounded("get", async { Ok(call.await) }).await else {
+            return vec![None; keys.len()];
+        };
+        let mut values = Vec::with_capacity(keys.len());
+        let mut failed = None;
+        for result in results {
+            match result {
+                Ok(value) => values.push(value),
+                Err(e) => {
+                    failed.get_or_insert(e);
+                    values.push(None);
+                }
+            }
         }
+        if let Some(e) = failed {
+            self.note("get", e);
+        }
+        values
     }
 
     async fn set_many(&self, writes: &[(String, String, u64)]) {
         if writes.is_empty() || self.paused() {
             return;
         }
-        let mut conn = self.conn.clone();
-        let mut pipe = redis::pipe();
-        for (key, value, ttl) in writes {
-            pipe.set_ex(key, value, *ttl).ignore();
-        }
-        self.bounded("set", pipe.query_async::<()>(&mut conn)).await;
+        let conn = self.conn.get();
+        let call = each(writes, |(key, value, ttl)| {
+            let mut conn = conn.clone();
+            async move { conn.set_ex::<_, _, ()>(key, value, *ttl).await }
+        });
+        self.bounded("set", async { first_error(call.await) }).await;
     }
 
     async fn delete_many(&self, keys: &[String]) {
         if keys.is_empty() || self.paused() {
             return;
         }
-        let mut conn = self.conn.clone();
-        self.bounded("del", conn.del::<_, ()>(keys)).await;
+        let conn = self.conn.get();
+        let call = each(keys, |key| {
+            let mut conn = conn.clone();
+            async move { conn.del::<_, ()>(key).await }
+        });
+        self.bounded("del", async { first_error(call.await) }).await;
     }
 
     async fn healthy(&self) -> bool {
-        let mut conn = self.conn.clone();
-        redis::cmd("PING").query_async::<String>(&mut conn).await.is_ok()
+        let mut conn = self.conn.get();
+        self.conn.check(redis::cmd("PING").query_async::<String>(&mut conn).await).is_ok()
     }
 }
 
@@ -203,7 +364,7 @@ impl CacheBackend for RedisCache {
 /// than taking it to the grave.
 #[derive(Clone)]
 pub struct RedisQueue {
-    conn: ConnectionManager,
+    conn: Cluster,
     maxlen: usize,
     group: String,
     consumer: String,
@@ -260,10 +421,17 @@ impl RedisQueue {
         consumer: String,
         redeliver_after: std::time::Duration,
         cfg: &crate::config::QueueCfg,
+        reload_ms: u64,
     ) -> Result<Self, String> {
         let queue = Self {
-            conn: connect_with(url, cfg.dial_timeout_ms, cfg.read_timeout_ms, cfg.max_retries)
-                .await?,
+            conn: Cluster::open(
+                url,
+                Some(Duration::from_millis(cfg.dial_timeout_ms)),
+                Some(Duration::from_millis(cfg.read_timeout_ms)),
+                u32::try_from(cfg.max_retries).unwrap_or(u32::MAX),
+                reload_ms,
+            )
+            .await?,
             maxlen,
             group: "ichnos".into(),
             consumer,
@@ -318,7 +486,7 @@ impl RedisQueue {
         let failed = || {
             crate::metrics::metrics().queue_errors.with_label_values(&["prune"]).inc();
         };
-        let mut conn = self.conn.clone();
+        let mut conn = self.conn.get();
         let reply: redis::Value = match redis::cmd("XINFO")
             .arg("CONSUMERS")
             .arg(Self::stream(shard))
@@ -327,7 +495,10 @@ impl RedisQueue {
             .await
         {
             Ok(reply) => reply,
-            Err(_) => return failed(),
+            Err(e) => {
+                self.conn.failed(e);
+                return failed();
+            }
         };
         let redis::Value::Array(consumers) = reply else { return };
         let idle_ms = self.consumer_idle.as_millis() as i64;
@@ -355,9 +526,10 @@ impl RedisQueue {
     /// The error for a failed publish. One the server did not answer pauses
     /// publishing; a refusal is that publish's problem.
     fn publish_failed(&self, error: redis::RedisError) -> QueueError {
-        if matches!(error.kind(), ErrorKind::Server(_) | ErrorKind::Extension) {
+        if refused(&error) {
             return QueueError::Failed(error.to_string());
         }
+        self.conn.unanswered();
         let now = self.now();
         let old = self.resume_at.load(Ordering::Relaxed);
         if now >= old {
@@ -371,7 +543,7 @@ impl RedisQueue {
 
     /// Where the count of entries deleted after being done is kept.
     fn acked_key(shard: u32) -> String {
-        format!("obs:{shard}:acked")
+        format!("{}:acked", Self::stream(shard))
     }
 
     /// Entries the cap has discarded from every shard, ever.
@@ -384,7 +556,7 @@ impl RedisQueue {
     /// deletion is counted too; that needs a backlog past the cap, which is
     /// the loss this counts anyway.
     async fn trimmed_ever(&self) -> Result<u64, QueueError> {
-        let mut conn = self.conn.clone();
+        let mut conn = self.conn.get();
         let mut total = 0u64;
         for shard in 0..self.shards {
             let info: redis::Value = redis::cmd("XINFO")
@@ -392,7 +564,7 @@ impl RedisQueue {
                 .arg(Self::stream(shard))
                 .query_async(&mut conn)
                 .await
-                .map_err(|e| QueueError::Failed(e.to_string()))?;
+                .map_err(|e| QueueError::Failed(self.conn.failed(e).to_string()))?;
             let (length, added) = stream_counts(&info).ok_or_else(|| {
                 QueueError::Failed(
                     "XINFO STREAM has no entries-added; Redis 7 or later is needed".into(),
@@ -401,14 +573,20 @@ impl RedisQueue {
             let deleted: Option<u64> = conn
                 .get(Self::acked_key(shard))
                 .await
-                .map_err(|e| QueueError::Failed(e.to_string()))?;
+                .map_err(|e| QueueError::Failed(self.conn.failed(e).to_string()))?;
             total += added.saturating_sub(length).saturating_sub(deleted.unwrap_or(0));
         }
         Ok(total)
     }
 
+    /// The stream holding one shard. The braces are a hash tag: the cluster
+    /// places a key by the part in braces alone, so the stream and its
+    /// counter, which the acknowledgement script changes together, share a
+    /// slot. The tag is the whole name rather than the number, which spreads
+    /// shards more evenly over three primaries: 32 shards 11, 12 and 9 rather
+    /// than 13, 11 and 8.
     fn stream(shard: u32) -> String {
-        format!("obs:{shard}")
+        format!("{{obs:{shard}}}")
     }
 
     /// Create the consumer group, tolerating the case where it already exists.
@@ -419,15 +597,17 @@ impl RedisQueue {
     /// Create the consumer group reading from `start`, tolerating the case
     /// where it already exists.
     async fn create_group(&self, shard: u32, start: &str) -> Result<(), String> {
-        let mut conn = self.conn.clone();
-        let result: Result<String, redis::RedisError> = redis::cmd("XGROUP")
-            .arg("CREATE")
-            .arg(Self::stream(shard))
-            .arg(&self.group)
-            .arg(start)
-            .arg("MKSTREAM")
-            .query_async(&mut conn)
-            .await;
+        let mut conn = self.conn.get();
+        let result: Result<String, redis::RedisError> = self.conn.check(
+            redis::cmd("XGROUP")
+                .arg("CREATE")
+                .arg(Self::stream(shard))
+                .arg(&self.group)
+                .arg(start)
+                .arg("MKSTREAM")
+                .query_async(&mut conn)
+                .await,
+        );
         match result {
             Ok(_) => Ok(()),
             Err(e) if e.to_string().contains("BUSYGROUP") => Ok(()),
@@ -447,7 +627,7 @@ impl RedisQueue {
         shard: u32,
         max: usize,
     ) -> Result<(Vec<Entry>, Vec<String>), QueueError> {
-        let mut conn = self.conn.clone();
+        let mut conn = self.conn.get();
         let idle_ms = self.redeliver_after.as_millis() as u64;
         let mut cursor = "0-0".to_string();
         let mut entries = Vec::new();
@@ -468,7 +648,7 @@ impl RedisQueue {
                 .arg(wanted)
                 .query_async(&mut conn)
                 .await
-                .map_err(|e| QueueError::Failed(e.to_string()))?;
+                .map_err(|e| QueueError::Failed(self.conn.failed(e).to_string()))?;
 
             let redis::Value::Array(parts) = reply else { break };
             let next = parts.first().and_then(as_string).unwrap_or_else(|| "0-0".into());
@@ -496,7 +676,7 @@ impl RedisQueue {
         // lost the shard, or failed to write would stay pending for ever.
         let (mut entries, mut malformed) = self.reclaim(shard, max).await?;
         if entries.is_empty() {
-            let mut conn = self.conn.clone();
+            let mut conn = self.conn.get();
             let reply: redis::Value = redis::cmd("XREADGROUP")
                 .arg("GROUP")
                 .arg(&self.group)
@@ -508,7 +688,7 @@ impl RedisQueue {
                 .arg(">")
                 .query_async(&mut conn)
                 .await
-                .map_err(|e| QueueError::Failed(e.to_string()))?;
+                .map_err(|e| QueueError::Failed(self.conn.failed(e).to_string()))?;
             let (fresh, bad) = parse_stream_reply(&reply);
             entries = fresh;
             malformed.extend(bad);
@@ -536,8 +716,9 @@ impl Queue for RedisQueue {
         if self.now() < self.resume_at.load(Ordering::Relaxed) {
             return Err(QueueError::Unavailable("paused: the server stopped answering".into()));
         }
-        let mut conn = self.conn.clone();
-        let mut pipe = redis::pipe();
+        // One pipeline per shard, all sent at once: a cluster takes a
+        // pipeline only if its keys share a slot, and a shard is one slot.
+        let mut pipes: std::collections::BTreeMap<u32, redis::Pipeline> = Default::default();
         let mut accepted = 0;
 
         for (shard, observation) in entries {
@@ -546,7 +727,10 @@ impl Queue for RedisQueue {
             // MAXLEN ~ is the approximate form: it trims at node boundaries,
             // which is far cheaper than exact trimming and just as effective at
             // bounding memory.
-            pipe.cmd("XADD")
+            pipes
+                .entry(*shard)
+                .or_insert_with(redis::pipe)
+                .cmd("XADD")
                 .arg(Self::stream(*shard))
                 .arg("MAXLEN")
                 .arg("~")
@@ -558,7 +742,12 @@ impl Queue for RedisQueue {
             accepted += 1;
         }
 
-        pipe.query_async::<()>(&mut conn).await.map_err(|e| self.publish_failed(e))?;
+        let conn = self.conn.get();
+        let sent = each(pipes.values(), |pipe| {
+            let mut conn = conn.clone();
+            async move { pipe.query_async::<()>(&mut conn).await }
+        });
+        first_error(sent.await).map_err(|e| self.publish_failed(e))?;
         Ok(accepted)
     }
 
@@ -582,7 +771,7 @@ impl Queue for RedisQueue {
     }
 
     async fn ack(&self, shard: u32, ids: &[String]) -> Result<(), QueueError> {
-        let mut conn = self.conn.clone();
+        let mut conn = self.conn.get();
         // Acknowledging does not remove an entry from a stream. Without the
         // delete every stream would sit at its cap for ever, so depth would
         // count finished work and the cap would trim what was already done.
@@ -595,18 +784,18 @@ impl Queue for RedisQueue {
                 .arg(chunk)
                 .invoke_async::<i64>(&mut conn)
                 .await
-                .map_err(|e| QueueError::Failed(e.to_string()))?;
+                .map_err(|e| QueueError::Failed(self.conn.failed(e).to_string()))?;
         }
         Ok(())
     }
 
     async fn depth(&self, shard: u32) -> Result<usize, QueueError> {
-        let mut conn = self.conn.clone();
+        let mut conn = self.conn.get();
         let len: i64 = redis::cmd("XLEN")
             .arg(Self::stream(shard))
             .query_async(&mut conn)
             .await
-            .map_err(|e| QueueError::Failed(e.to_string()))?;
+            .map_err(|e| QueueError::Failed(self.conn.failed(e).to_string()))?;
         Ok(len.max(0) as usize)
     }
 
@@ -615,8 +804,8 @@ impl Queue for RedisQueue {
     }
 
     async fn healthy(&self) -> bool {
-        let mut conn = self.conn.clone();
-        redis::cmd("PING").query_async::<String>(&mut conn).await.is_ok()
+        let mut conn = self.conn.get();
+        self.conn.check(redis::cmd("PING").query_async::<String>(&mut conn).await).is_ok()
     }
 }
 
@@ -757,7 +946,7 @@ fn as_string(value: &redis::Value) -> Option<String> {
 /// to answer, counting is skipped for `cache.pauseMs`.
 #[derive(Clone)]
 pub struct RedisQuota {
-    conn: ConnectionManager,
+    conn: Cluster,
     pause: Duration,
     /// The most one count may take, all in.
     budget: Duration,
@@ -771,12 +960,21 @@ pub struct RedisQuota {
 
 impl RedisQuota {
     /// Connect with the cache's limits; a counter lives `keep_hours`.
+    /// `reload_ms` is `redis.clusterReloadMs`.
     pub async fn connect(
         url: &str,
         cfg: &crate::config::Cache,
         keep_hours: u64,
+        reload_ms: u64,
     ) -> Result<Self, String> {
-        let conn = connect_with(url, cfg.dial_timeout_ms, cfg.read_timeout_ms, 1).await?;
+        let conn = Cluster::open(
+            url,
+            Some(Duration::from_millis(cfg.dial_timeout_ms)),
+            Some(Duration::from_millis(cfg.read_timeout_ms)),
+            1,
+            reload_ms,
+        )
+        .await?;
         Ok(Self {
             conn,
             pause: Duration::from_millis(cfg.pause_ms),
@@ -818,7 +1016,7 @@ impl crate::api::quota::QuotaCounter for RedisQuota {
         if self.now() < self.resume_at.load(Ordering::Relaxed) {
             return None;
         }
-        let mut conn = self.conn.clone();
+        let mut conn = self.conn.get();
         let counter = crate::api::quota::counter_key(key);
         // Increment and set the expiry together, so a counter cannot survive
         // past the day it belongs to if the second command were to be lost.
@@ -827,12 +1025,14 @@ impl crate::api::quota::QuotaCounter for RedisQuota {
         match tokio::time::timeout(self.budget, pipe.query_async::<(i64,)>(&mut conn)).await {
             Ok(Ok((count,))) => Some(count),
             Ok(Err(e)) => {
-                if !matches!(e.kind(), ErrorKind::Server(_) | ErrorKind::Extension) {
+                if !refused(&e) {
+                    self.conn.unanswered();
                     self.pause_now(&e.to_string());
                 }
                 None
             }
             Err(_) => {
+                self.conn.unanswered();
                 self.pause_now("no answer within the call budget");
                 None
             }
@@ -851,7 +1051,7 @@ impl crate::api::quota::QuotaCounter for RedisQuota {
 /// that now belongs to somebody else.
 #[derive(Clone)]
 pub struct RedisLeases {
-    conn: ConnectionManager,
+    conn: Cluster,
 }
 
 const RENEW_SCRIPT: &str = r#"
@@ -871,8 +1071,10 @@ end
 "#;
 
 impl RedisLeases {
-    pub async fn connect(url: &str) -> Result<Self, String> {
-        Ok(Self { conn: connect(url).await? })
+    /// Connect with the library's timeouts; `reload_ms` is
+    /// `redis.clusterReloadMs`.
+    pub async fn connect(url: &str, reload_ms: u64) -> Result<Self, String> {
+        Ok(Self { conn: Cluster::open(url, None, None, 1, reload_ms).await? })
     }
 
     fn key(shard: u32) -> String {
@@ -883,7 +1085,7 @@ impl RedisLeases {
 #[async_trait]
 impl Leases for RedisLeases {
     async fn acquire(&self, shard: u32, owner: &str, ttl: Duration) -> Result<bool, LeaseError> {
-        let mut conn = self.conn.clone();
+        let mut conn = self.conn.get();
         // Re-acquiring a shard this worker already holds is a renewal, so try
         // that first rather than reporting a conflict with itself.
         if self.renew(shard, owner, ttl).await? {
@@ -897,42 +1099,42 @@ impl Leases for RedisLeases {
             .arg(ttl.as_secs().max(1))
             .query_async(&mut conn)
             .await
-            .map_err(|e| LeaseError::Unavailable(e.to_string()))?;
+            .map_err(|e| LeaseError::Unavailable(self.conn.failed(e).to_string()))?;
         Ok(reply.is_some())
     }
 
     async fn renew(&self, shard: u32, owner: &str, ttl: Duration) -> Result<bool, LeaseError> {
-        let mut conn = self.conn.clone();
+        let mut conn = self.conn.get();
         let changed: i64 = redis::Script::new(RENEW_SCRIPT)
             .key(Self::key(shard))
             .arg(owner)
             .arg(ttl.as_secs().max(1))
             .invoke_async(&mut conn)
             .await
-            .map_err(|e| LeaseError::Unavailable(e.to_string()))?;
+            .map_err(|e| LeaseError::Unavailable(self.conn.failed(e).to_string()))?;
         Ok(changed == 1)
     }
 
     async fn release(&self, shard: u32, owner: &str) -> Result<(), LeaseError> {
-        let mut conn = self.conn.clone();
+        let mut conn = self.conn.get();
         redis::Script::new(RELEASE_SCRIPT)
             .key(Self::key(shard))
             .arg(owner)
             .invoke_async::<i64>(&mut conn)
             .await
-            .map_err(|e| LeaseError::Unavailable(e.to_string()))?;
+            .map_err(|e| LeaseError::Unavailable(self.conn.failed(e).to_string()))?;
         Ok(())
     }
 
     async fn holder(&self, shard: u32) -> Result<Option<String>, LeaseError> {
-        let mut conn = self.conn.clone();
+        let mut conn = self.conn.get();
         conn.get::<_, Option<String>>(Self::key(shard))
             .await
-            .map_err(|e| LeaseError::Unavailable(e.to_string()))
+            .map_err(|e| LeaseError::Unavailable(self.conn.failed(e).to_string()))
     }
 
     async fn heartbeat(&self, owner: &str, _ttl: Duration) -> Result<(), LeaseError> {
-        let mut conn = self.conn.clone();
+        let mut conn = self.conn.get();
         // A sorted set scored by time, so counting live workers is a range
         // query rather than a scan, and a worker that stops announcing itself
         // falls out on its own.
@@ -943,12 +1145,12 @@ impl Leases for RedisLeases {
             .arg(owner)
             .query_async::<i64>(&mut conn)
             .await
-            .map_err(|e| LeaseError::Unavailable(e.to_string()))?;
+            .map_err(|e| LeaseError::Unavailable(self.conn.failed(e).to_string()))?;
         Ok(())
     }
 
     async fn live_workers(&self, ttl: Duration) -> Result<Vec<String>, LeaseError> {
-        let mut conn = self.conn.clone();
+        let mut conn = self.conn.get();
         let cutoff = chrono::Utc::now().timestamp() - ttl.as_secs().max(1) as i64;
         // Drop the ones that have gone quiet, then list what is left.
         let (_, mut live): (i64, Vec<String>) = redis::pipe()
@@ -963,7 +1165,7 @@ impl Leases for RedisLeases {
             .arg(-1)
             .query_async(&mut conn)
             .await
-            .map_err(|e| LeaseError::Unavailable(e.to_string()))?;
+            .map_err(|e| LeaseError::Unavailable(self.conn.failed(e).to_string()))?;
         live.sort();
         Ok(live)
     }
@@ -982,8 +1184,9 @@ mod tests {
 
     #[test]
     fn stream_names_are_stable_per_shard() {
-        assert_eq!(RedisQueue::stream(0), "obs:0");
-        assert_eq!(RedisQueue::stream(31), "obs:31");
+        assert_eq!(RedisQueue::stream(0), "{obs:0}");
+        assert_eq!(RedisQueue::stream(31), "{obs:31}");
+        assert_eq!(RedisQueue::acked_key(3), "{obs:3}:acked");
         assert_eq!(RedisLeases::key(7), "lease:7");
     }
 
@@ -1053,6 +1256,42 @@ mod tests {
     fn an_empty_reply_is_no_entries_rather_than_an_error() {
         assert_eq!(parse_stream_reply(&redis::Value::Nil), (vec![], vec![]));
         assert_eq!(parse_stream_reply(&redis::Value::Array(vec![])), (vec![], vec![]));
+    }
+
+    #[tokio::test]
+    async fn a_cluster_has_only_database_zero() {
+        let err = Cluster::open("redis://127.0.0.1:1/3", None, None, 0, 1_000).await.err();
+        assert!(err.unwrap().contains("only database 0"));
+    }
+
+    /// A connection the server did not answer is made again, once per reload
+    /// interval, and the new one works.
+    #[tokio::test]
+    async fn an_unanswered_command_makes_a_new_connection_once_per_interval() {
+        let Ok(url) = std::env::var("ICHNOS_TEST_REDIS") else {
+            eprintln!("skipped: ICHNOS_TEST_REDIS is not set");
+            return;
+        };
+        let cluster = Cluster::open(&url, None, None, 0, 60_000).await.unwrap();
+        let ping = |c: &Cluster| {
+            let mut conn = c.get();
+            async move { redis::cmd("PING").query_async::<String>(&mut conn).await }
+        };
+        // A refusal is the server's answer: nothing is made again.
+        let refusal = RedisError::from((ErrorKind::Server(redis::ServerErrorKind::ReadOnly), "x"));
+        let _ = cluster.failed(refusal);
+        assert_eq!(cluster.next_reload.load(Ordering::Relaxed), 0);
+        cluster.unanswered();
+        cluster.unanswered();
+        for _ in 0..100 {
+            if cluster.remade.load(Ordering::Relaxed) > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(cluster.remade.load(Ordering::Relaxed), 1, "made again once per interval");
+        assert_eq!(ping(&cluster).await.unwrap(), "PONG");
     }
 
     #[test]

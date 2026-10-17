@@ -22,7 +22,7 @@ tower-http = { version = "0.7", features = ["trace", "timeout"] }
 
 # storage
 scylla = { version = "1.8", features = ["chrono-04"] }
-redis = { version = "1.7", features = ["tokio-comp", "connection-manager"] }
+redis = { version = "1.7", features = ["tokio-comp", "cluster-async"] }
 
 # math: these mirror what Ichnaea uses in Python
 kodama = "0.3"                 # complete-linkage clustering, as scipy.cluster.hierarchy does

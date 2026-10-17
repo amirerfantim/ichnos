@@ -85,7 +85,7 @@ curl -X POST 'localhost:8080/v1/locate?key=dev-key' \
 With real storage:
 
 ```bash
-docker compose up -d                      # ScyllaDB and two Redis instances
+docker compose up -d                      # ScyllaDB and two one-node Redis clusters
 cqlsh -f schema/001_init.cql              # once; 002 upgrades an older keyspace
 cargo run -- keys add my-key --locate --submit
 cargo run -- serve                        # the API
@@ -350,6 +350,7 @@ changing.
 |---|---|
 | Cache Redis | Reads get slower. Nothing fails. |
 | Queue Redis | Learning pauses; answering is unaffected. Dropped observations are counted. |
+| A Redis primary dies | Its replica takes over after the cluster's node timeout. A command the dead node did not answer makes the connection again with a fresh map of the cluster, at most once per `redis.clusterReloadMs` (1 s), so commands follow the replica soon after. |
 | One database node | Nothing visible, at a replication factor above one. |
 | The whole database | Locates whose stations are all cached are answered; the rest get `404` with `X-Ichnos-Degraded`. A worker ends its pass at the first shard that finds the database gone and keeps its leases; the batch is taken again after the redelivery wait. |
 | A worker dies | Its lease expires, another takes the shard, and its unacknowledged batch is redelivered. |
