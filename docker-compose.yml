@@ -17,17 +17,32 @@ services:
       timeout: 5s
       retries: 20
 
+  # Each Redis is a Redis Cluster of one node, the smallest cluster: Ichnos
+  # speaks only the cluster protocol. A node told nothing reports no address
+  # of its own, so each announces the one the host reaches it at. The health
+  # check gives a fresh node every slot; the node is healthy once the cluster
+  # is up.
   redis-cache:
     image: redis:7-alpine
     # Evicting here costs a database read. That is an acceptable trade.
-    command: redis-server --maxmemory 256mb --maxmemory-policy allkeys-lru --save ""
+    command: >
+      redis-server --maxmemory 256mb --maxmemory-policy allkeys-lru --save ""
+      --cluster-enabled yes --cluster-announce-ip 127.0.0.1 --cluster-announce-port 6379
     ports:
       - "6379:6379"
+    healthcheck: &cluster-health
+      test: ["CMD-SHELL", "redis-cli cluster info | grep -q cluster_state:ok || { redis-cli cluster addslotsrange 0 16383; exit 1; }"]
+      interval: 1s
+      timeout: 3s
+      retries: 30
 
   redis-queue:
     image: redis:7-alpine
     # Evicting here costs data. Losing a queue entry must be a counted decision
     # made by the stream cap, never a side effect of memory pressure.
-    command: redis-server --maxmemory 256mb --maxmemory-policy noeviction --save ""
+    command: >
+      redis-server --maxmemory 256mb --maxmemory-policy noeviction --save ""
+      --cluster-enabled yes --cluster-announce-ip 127.0.0.1 --cluster-announce-port 6380
     ports:
       - "6380:6379"
+    healthcheck: *cluster-health

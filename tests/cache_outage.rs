@@ -21,7 +21,7 @@ async fn a_cache_that_stops_answering_is_skipped_and_then_tried_again() {
     };
     let pause = Duration::from_millis(300);
     let cfg = Cache { pause_ms: pause.as_millis() as u64, ..Cache::default() };
-    let cache = RedisCache::connect(&url, &cfg).await.unwrap();
+    let cache = RedisCache::connect(&url, &cfg, 1_000).await.unwrap();
     let key = format!("cache-outage-{}", std::process::id());
     cache.set_many(&[(key.clone(), "1".into(), 60)]).await;
     assert_eq!(cache.get_many(std::slice::from_ref(&key)).await, vec![Some("1".to_string())]);

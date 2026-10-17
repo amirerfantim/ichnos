@@ -14,18 +14,27 @@ jobs:
     runs-on: ubuntu-latest
     # A real Redis, so the queue, lease and cache tests in tests/backends.rs
     # run instead of skipping. Redelivery in particular only exists in Redis.
-    services:
-      redis:
-        image: redis:7-alpine
-        ports: ["6379:6379"]
-        options: >-
-          --health-cmd "redis-cli ping" --health-interval 5s
-          --health-timeout 3s --health-retries 10
     env:
       ICHNOS_TEST_REDIS: redis://127.0.0.1:6379/0
-      ICHNOS_TEST_REDIS_QUEUE: redis://127.0.0.1:6379/1
+      ICHNOS_TEST_REDIS_QUEUE: redis://127.0.0.1:6380/0
     steps:
       - uses: actions/checkout@v4
+      # Two Redis Clusters of one node each, as Ichnos speaks only the
+      # cluster protocol; two, because a cluster has only database 0 and two
+      # tests count trims across every shard. Started here, not as services,
+      # because a service takes no command line. A lone node knows no address
+      # of its own, so each announces the one the job reaches it at, and it
+      # serves once it holds every slot.
+      - name: Redis clusters
+        run: |
+          for port in 6379 6380; do
+            docker run -d --name redis-$port -p $port:6379 redis:7-alpine redis-server --save "" \
+              --cluster-enabled yes --cluster-announce-ip 127.0.0.1 --cluster-announce-port $port
+          done
+          for port in 6379 6380; do
+            until docker exec redis-$port redis-cli cluster addslotsrange 0 16383; do sleep 1; done
+            until docker exec redis-$port redis-cli cluster info | grep -q cluster_state:ok; do sleep 1; done
+          done
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy

@@ -162,7 +162,7 @@ async fn build_store(cfg: &Config, in_memory: bool) -> Result<Arc<dyn Store>> {
 
     let store = CqlStore::connect(&cfg.cql).await.context("connecting to the database")?;
 
-    match RedisCache::connect(&cfg.redis.cache_url, &cfg.cache).await {
+    match RedisCache::connect(&cfg.redis.cache_url, &cfg.cache, cfg.redis.cluster_reload_ms).await {
         Ok(cache) => Ok(Arc::new(CachedStore::new(store, cache, cfg.cache.clone()))),
         Err(e) => {
             // A missing cache makes reads slower, not impossible, so it is not
@@ -190,6 +190,7 @@ async fn build_queue(cfg: &Config, in_memory: bool, consumer: String) -> Result<
         consumer,
         redeliver_after(cfg),
         &cfg.queue,
+        cfg.redis.cluster_reload_ms,
     )
     .await
     .map_err(|e| anyhow::anyhow!("connecting to the queue: {e}"))?;
@@ -240,7 +241,7 @@ async fn serve(cfg: Config, in_memory: bool, with_worker: bool) -> Result<()> {
             Arc::new(ichnos::ingest::lease::MemoryLeases::new())
         } else {
             Arc::new(
-                RedisLeases::connect(&cfg.redis.queue_url)
+                RedisLeases::connect(&cfg.redis.queue_url, cfg.redis.cluster_reload_ms)
                     .await
                     .map_err(|e| anyhow::anyhow!("connecting to the lease registry: {e}"))?,
             )
@@ -264,7 +265,13 @@ async fn serve(cfg: Config, in_memory: bool, with_worker: bool) -> Result<()> {
     let quota: Arc<dyn QuotaCounter> = if in_memory {
         Arc::new(MemoryQuota::new())
     } else {
-        match RedisQuota::connect(&cfg.redis.cache_url, &cfg.cache, cfg.api.quota_keep_hours).await
+        match RedisQuota::connect(
+            &cfg.redis.cache_url,
+            &cfg.cache,
+            cfg.api.quota_keep_hours,
+            cfg.redis.cluster_reload_ms,
+        )
+        .await
         {
             Ok(counter) => Arc::new(counter),
             Err(e) => {
@@ -299,7 +306,7 @@ async fn run_worker(cfg: Config, in_memory: bool, identity_arg: Option<String>) 
         Arc::new(ichnos::ingest::lease::MemoryLeases::new())
     } else {
         Arc::new(
-            RedisLeases::connect(&cfg.redis.queue_url)
+            RedisLeases::connect(&cfg.redis.queue_url, cfg.redis.cluster_reload_ms)
                 .await
                 .map_err(|e| anyhow::anyhow!("connecting to the lease registry: {e}"))?,
         )

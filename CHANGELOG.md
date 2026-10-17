@@ -4,6 +4,21 @@
 
 ### Added
 
+- **Redis is Redis Cluster.** Every Redis connection is a cluster
+  connection, so the cache, the quota counters, the queue and the leases can
+  live on a cluster of any size; a small deployment runs a cluster of one
+  node, which holds every slot. The queue streams are named `{obs:N}` and
+  their counters `{obs:N}:acked`: the braces keep a stream and its counter on
+  one slot, which the acknowledgement script needs. A cluster refuses a
+  command or a pipeline whose keys are in different slots, so the cache sends
+  one `GET`, `SET` or `DEL` per key, all at once, instead of `MGET`, one
+  pipeline or a multi-key `DEL`, and a publish sends one pipeline per shard.
+  A Redis URL may name only database 0. A command a node did not answer makes
+  the connection again, with a fresh map of the cluster, at most once per
+  `redis.clusterReloadMs` (1 s): the library reads the map again only when a
+  node redirects it, which a dead primary cannot. Upgrading drops what the
+  old streams held.
+
 - **Learning from locate answers, as upstream does.** A key with
   `store_sample_locate` above zero (`ichnos keys add --store-sample-locate`)
   feeds that share of its answered locates back as reports: the networks the
