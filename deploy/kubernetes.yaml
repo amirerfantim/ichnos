@@ -23,6 +23,8 @@ data:
       consistencyWrite: LOCAL_QUORUM
       consistencyRead: LOCAL_ONE
       ttlDays: 180
+    # Each a Redis Cluster, by one of its nodes; one node holding every slot
+    # is enough.
     redis:
       cacheUrl: redis://redis-cache:6379/0
       queueUrl: redis://redis-queue:6379/0
