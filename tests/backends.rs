@@ -332,9 +332,11 @@ async fn the_redis_queue_carries_observations_and_holds_them_until_acknowledged(
 /// Stream names are fixed per shard, so a test that counts pending entries
 /// needs a shard to itself: the queues here are built with more shards than
 /// any other test asks for, and each test picks its own.
-async fn private_shard(url: &str, shard: u32) -> redis::aio::MultiplexedConnection {
-    let client = redis::Client::open(url).unwrap();
-    let mut conn = client.get_multiplexed_async_connection().await.unwrap();
+/// A cluster connection, so a key on any node is reached, as the service
+/// reaches it.
+async fn private_shard(url: &str, shard: u32) -> redis::cluster_async::ClusterConnection {
+    let client = redis::cluster::ClusterClient::new(vec![url]).unwrap();
+    let mut conn = client.get_async_connection().await.unwrap();
     // One DEL with both keys: they share a slot, as the queue's do.
     let _: () = redis::cmd("DEL")
         .arg(format!("{{obs:{shard}}}"))
@@ -345,11 +347,11 @@ async fn private_shard(url: &str, shard: u32) -> redis::aio::MultiplexedConnecti
     conn
 }
 
-async fn stream_len(conn: &mut redis::aio::MultiplexedConnection, shard: u32) -> u64 {
+async fn stream_len(conn: &mut redis::cluster_async::ClusterConnection, shard: u32) -> u64 {
     redis::cmd("XLEN").arg(format!("{{obs:{shard}}}")).query_async(conn).await.unwrap()
 }
 
-async fn pending_in_group(conn: &mut redis::aio::MultiplexedConnection, shard: u32) -> i64 {
+async fn pending_in_group(conn: &mut redis::cluster_async::ClusterConnection, shard: u32) -> i64 {
     let reply: redis::Value = redis::cmd("XPENDING")
         .arg(format!("{{obs:{shard}}}"))
         .arg("ichnos")
