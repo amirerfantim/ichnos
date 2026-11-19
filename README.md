@@ -1,5 +1,9 @@
 # Ichnos
 
+[![CI](https://github.com/amirerfantim/ichnos/actions/workflows/ci.yml/badge.svg)](https://github.com/amirerfantim/ichnos/actions/workflows/ci.yml)
+[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+![Rust 1.98+](https://img.shields.io/badge/rust-1.98%2B-orange.svg)
+
 Ichnos works out where a device is from the WiFi access points and cell towers
 it can see, and learns where those stations are from devices that already know
 their own position.
@@ -24,6 +28,11 @@ collection and asks a question of an endpoint that computes.
 POST /v1/observations   "I am here, and these are the stations I can see"
 POST /v1/locate         "These are the stations I can see. Where am I?"
 ```
+
+**Contents:** [Why it exists](#why-it-exists) ·
+[Quick start](#quick-start) · [The API](#the-api) · [How it works](#how-it-works) ·
+[Configuration](#configuration) · [Operations](#operations) · [Replay](#replay) ·
+[Development](#development) · [Licence](#licence)
 
 ---
 
@@ -55,6 +64,10 @@ Ichnos keeps the algorithm and rebuilds the machine around it:
 
 ## Quick start
 
+You need Rust 1.98 or newer (`rust-version` in `Cargo.toml`). The in-memory mode
+needs nothing else. Real storage needs Docker (for ScyllaDB and Redis) and
+`cqlsh` for the schema step.
+
 Everything in memory, no dependencies, one command:
 
 ```bash
@@ -72,7 +85,7 @@ curl -X POST 'localhost:8080/v1/observations?key=dev-key' \
         {"macAddress": "aabbccddee01", "signalStrength": -65, "frequency": 2412},
         {"macAddress": "aabbccddee02", "signalStrength": -70, "frequency": 2437}]}]}'
 
-# wait for the fold window, then:
+# wait for the fold window (45 s by default, ingest.foldWindowSecs), then:
 curl -X POST 'localhost:8080/v1/locate?key=dev-key' \
   -H 'Content-Type: application/json' -d '{
     "wifiAccessPoints": [
@@ -386,10 +399,12 @@ cargo run -- serve --in-memory --with-worker
 ```
 
 The maths was checked against the original rather than against a description
-of it; nothing at run time depends on Ichnaea. `docs/reference/` holds the generators: one transcribes Ichnaea's geodesy
-into Python, the other runs the real `scipy` over Ichnaea's own objective
-function and clustering. The golden values in the tests come from those, and can
-be regenerated.
+of it; nothing at run time depends on Ichnaea. `docs/reference/` holds the
+generators: one transcribes Ichnaea's geodesy into Python, the other runs the
+real `scipy` over Ichnaea's own objective function and clustering. The golden
+values in the tests come from those, and can be regenerated.
+
+What changed between versions is listed in [CHANGELOG.md](CHANGELOG.md).
 
 Two deliberate differences from upstream are recorded in the code where they
 happen:
@@ -427,6 +442,13 @@ src/
 
 Apache-2.0. See [LICENSE](LICENSE).
 
-The positioning algorithm is derived from [Mozilla Ichnaea][ichnaea], which is
-licensed under the Mozilla Public License 2.0. No Ichnaea source is included
-here; the algorithm was reimplemented and checked against it.
+Ichnos reimplements the positioning algorithm of [Mozilla Ichnaea][ichnaea],
+which is also licensed under Apache-2.0. Parts of Ichnos follow Ichnaea's code
+closely:
+
+- `src/geo.rs` is ported line for line from Ichnaea's `geocalclib/geocalc.pyx`.
+- The scripts in `docs/reference/` transcribe Ichnaea's geodesy code and mirror
+  its position fit and clustering, to produce the golden values for the tests.
+
+Those parts remain under Ichnaea's licence, and credit for them goes to its
+authors. Nothing at run time depends on Ichnaea.
